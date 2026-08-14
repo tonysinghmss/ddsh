@@ -1,2 +1,2 @@
 # ddsh
-Demo code for deepseek harness based on Golang
+Demo code to create an application based on the original paper published by DeepSeek for deepseek-harness.
