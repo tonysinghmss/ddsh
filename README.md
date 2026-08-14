@@ -1,7 +1,4 @@
-# ddsh
-Demo code to create an application based on the original paper published by DeepSeek for deepseek-harness.
-
-ddsh: Spatiotemporal Composability Framework
+# ddsh: Spatiotemporal Composability Framework
 
 A lightweight, deadlock-free, high-performance execution framework in Go implementing the foundational principles of Spatiotemporal Composability as introduced by the DeepSeek ecosystem (Cordis paradigm).This framework provides an autonomous runtime environment optimized for AI agents and distributed systems. It guarantees structural flexibility alongside strict, predictable temporal boundary isolations during hot-swaps, component upgrades, or runtime systemic failures.
 
@@ -20,8 +17,8 @@ The tree topology enforces strict hierarchical propagation: parent contexts gove
                      │
        ┌─────────────┴─────────────┐
        │                           │
-[Primary-Data-Subagent]  [Backup-Substitute-Subagent] <── Children Nodes
-(Fails & self-destructs)  (Spawned via Recovery Hook)
+ [Primary-Data-Subagent]      [Backup-Substitute-Subagent] <── Children Nodes
+ (Fails & self-destructs)  (Spawned via Recovery Hook)
 
 
 ## Key Framework Features
@@ -36,6 +33,7 @@ When winding down expansive software state trees, a bounded worker pool concurre
 Built-in traversal hooks allow failed contexts to securely consult parent trees before destruction. This ensures newly generated hot-swap substitutes are re-nested into the active living hierarchy seamlessly.
 
 ## Directory & File Structure
+
 
 ddsh/
 ├── go.mod             # Go Module Declaration
