@@ -41,3 +41,11 @@ ddsh/
 │   ├── context.go     # Spatiotemporal Context & Concurrent Rollback Engine
 │   └── tracker.go     # Coeffect Evaluator & Service Dependency Tracker
 └── main.go            # Operational Simulation Driver
+
+
+## Quick Start Execution
+Verify the compilation and view the framework lifecycle output log locally by typing:
+
+ bash
+
+ go run main.go
