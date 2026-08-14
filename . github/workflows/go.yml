@@ -1,0 +1,48 @@
+name: Spatiotemporal Harness CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  test-suite:
+    name: Verify and Stress Test Environment
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        # Test against the minimum supported version and the latest stable platform compiler
+        go-version: [ '1.21', '1.22' ]
+
+    steps:
+    - name: Checkout Code Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Go Development Environment
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ matrix.go-version }}
+        cache: true # Automatically provisions secure compression caching for your go.mod dependencies
+
+    - name: Verify Code Layout Formatting
+      run: |
+        if [ -n "$(gofmt -l .)" ]; then
+          echo "❌ The following files do not comply with official Go styling rules:"
+          gofmt -l .
+          exit 1
+        fi
+
+    - name: Execute Static Analysis Compiler Checks
+      run: go vet ./...
+
+    - name: Execute Concurrency-Focused Stress Tests
+      # -race: Employs ThreadSanitizer instrumentation to isolate concurrent lock data races or deadlocks
+      # -v: Enables full execution log tracing outputs
+      # -timeout: Guarantees CI steps fail cleanly if a deadlock locks up the testing worker
+      run: go test -v -race -timeout 3m ./...
