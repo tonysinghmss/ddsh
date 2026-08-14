@@ -1,3 +1,3 @@
-module demo-deepseek-harness
+module ddsh
 
 go 1.21
