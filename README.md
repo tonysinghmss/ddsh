@@ -46,6 +46,4 @@ ddsh/
 ## Quick Start Execution
 Verify the compilation and view the framework lifecycle output log locally by typing:
 
- bash
-
- go run main.go
+ `go run main.go`
