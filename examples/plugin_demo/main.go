@@ -90,12 +90,7 @@ func main() {
 	fmt.Println("This example demonstrates registration, coeffects, DAG planning,\n" +
 		"spatiotemporal effects, snapshots, replacement and reconciliation.")
 
-	// -------------------------------------------------------------------------
 	// 1. Create plugins and declare their coeffects.
-	// -------------------------------------------------------------------------
-	// storage has no requirements. processor requires storage. reporter has two
-	// providers; with the current ddsh semantics it remains eligible while at
-	// least one provider is active.
 	storage := newPlugin("storage")
 	processor := newPlugin("processor", "storage")
 	reporter := newPlugin("reporter", "storage", "metrics")
@@ -106,20 +101,17 @@ func main() {
 	tracker.RegisterComponent(root, reporter)
 	printGraph(tracker.Graph())
 
-	// storage is active immediately because it has no requirements. The other
-	// plugins are represented in the graph but wait for their coeffects.
+	// storage is active immediately because it has no requirements. processor
+	// is active because storage is already active. reporter waits for metrics.
 
-	// -------------------------------------------------------------------------
-	// 2. Reactively satisfy dependencies.
-	// -------------------------------------------------------------------------
+	// 2. Reactively satisfy the remaining dependency.
 	fmt.Println("\n--- 2. Activate dependency services ---")
 	tracker.ActivateService(root, "metrics")
-	tracker.ActivateService(root, "storage")
 	printGraph(tracker.Graph())
 
-	// -------------------------------------------------------------------------
-	// 3. Show the explicit public planning API.
-	// -------------------------------------------------------------------------
+	// 3. Use the explicit planning API. Planning and execution are separate
+	// public operations, which is useful when an application wants to inspect
+	// or persist a transition before executing it.
 	fmt.Println("\n--- 3. Build and execute an explicit dependency plan ---")
 	plan, err := tracker.Graph().PlanSleep("processor")
 	must(err)
@@ -138,9 +130,7 @@ func main() {
 		ParentContext: root,
 	}))
 
-	// -------------------------------------------------------------------------
 	// 5. Capture a known-good state.
-	// -------------------------------------------------------------------------
 	fmt.Println("\n--- 5. Create a last-known-good state checkpoint ---")
 	processorCtx := tracker.GetActiveContext("processor")
 	if processorCtx == nil {
@@ -165,14 +155,11 @@ func main() {
 	fmt.Printf("checkpoint version=%d captured=%s bytes=%d\n",
 		payload.Version, payload.Captured.Format(time.RFC3339), len(payload.Data))
 
-	// -------------------------------------------------------------------------
-	// 6. Simulate failure and perform state-aware replacement.
-	// -------------------------------------------------------------------------
+	// 6. Simulate a failure boundary. We explicitly roll back the failed
+	// runtime so the example is deterministic; the saved checkpoint survives
+	// rollback and is then consumed by RecoverWithReplacement.
 	fmt.Println("\n--- 6. Fail the plugin and replace it without changing DAG identity ---")
-	// Rollback tears down the old runtime. RecoverWithReplacement then uses the
-	// saved logical node plus its checkpoint to construct the replacement.
-	processorCtx.RaiseError(errors.New("processor connection failed"))
-	waitForRollback(processorCtx)
+	processorCtx.Rollback()
 
 	replacement := newPlugin("processor", "storage")
 	must(tracker.RecoverWithReplacement(root, "processor", replacement))
@@ -186,10 +173,8 @@ func main() {
 		atomic.LoadInt32(&replacement.restoreCount))
 	printGraph(tracker.Graph())
 
-	// -------------------------------------------------------------------------
-	// 7. Demonstrate hierarchical rollback.
-	// -------------------------------------------------------------------------
-	fmt.Println("\n--- 7. Roll back the application context ---")
+	// 7. Demonstrate hierarchical rollback independently of the DAG tracker.
+	fmt.Println("\n--- 7. Roll back a hierarchical application context ---")
 	rootScope := harness.NewSTContext(root, "application", nil)
 	rootScope.RegisterEffect("application-cleanup", func() {
 		fmt.Println("[EFFECT] application -> final cleanup")
@@ -212,22 +197,6 @@ func printGraph(graph *harness.DependencyGraph) {
 	for _, node := range graph.Nodes() {
 		fmt.Printf("  - %-10s active=%-5t\n", node.Name, node.Active)
 	}
-}
-
-func waitForRollback(ctx *harness.SpatioTemporalContext) {
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := ctx.StateSnapshot(); err == nil {
-			// The explicit checkpoint is retained after rollback, so the snapshot
-			// itself cannot tell us whether supervision has completed. The short
-			// sleep here gives the supervisor goroutine a deterministic scheduling
-			// opportunity before replacement is requested.
-			time.Sleep(10 * time.Millisecond)
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	panic("timed out waiting for failure supervision")
 }
 
 func must(err error) {
