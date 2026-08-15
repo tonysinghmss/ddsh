@@ -1,50 +1,178 @@
 # ddsh: Spatiotemporal Composability Framework
 
-A lightweight, deadlock-free, high-performance execution framework in Go implementing the foundational principles of Spatiotemporal Composability as introduced by the DeepSeek ecosystem (Cordis paradigm).This framework provides an autonomous runtime environment optimized for AI agents and distributed systems. It guarantees structural flexibility alongside strict, predictable temporal boundary isolations during hot-swaps, component upgrades, or runtime systemic failures.
+`ddsh` is a lightweight Go implementation of the core runtime ideas behind the **Cordis spatiotemporal composability paradigm** and the DeepSeek Harness “everything is a plugin” architecture.
 
-## Architectural Core Principles
-Traditional plugin systems rely on rigid interfaces and hardcoded static hooks. This repository shifts the paradigm by breaking composition down into two orthogonal runtime dimensions:
-1. Spatial Composability (The Structural Dimension)Implicit Capability Mapping: Components do not explicitly declare or register interfaces via explicit keywords. Instead, they implicitly satisfy runtime shapes purely by exposing matching method footprints.Spatio-Reactive Dependencies: Components describe their structural constraints as coeffects (declared via the Inject() block). Modules remain completely Asleep in memory until all nested environmental dependencies are satisfied, at which point the registry reactively wakes them up.
+> This repository is an educational/experimental implementation, not a full port of DeepSeek Harness. The upstream paper describes two orthogonal dimensions—**temporal composability** through revertible effects and **spatial composability** through reactive coeffects—and unifies them in a runtime context. `ddsh` implements those core mechanisms with Go interfaces, a dependency DAG, hierarchical contexts, deterministic plans and state-aware replacement.
 
-2. Temporal Composability (The Clock & Timeline Dimension)Dynamic Revertible Effects: Rather than using hardcoded teardown loops, actions register atomic inverse cleanup logic (Effect) on the fly. If an operation breaks or unloads, the framework automatically unwinds the runtime state in an append-only, Last-In, First-Out (LIFO) order.Asynchronous Fault Containment: Every subagent or component executes inside a self-similar, isolated tree context. An internal failure or panic fires localized teardown processes and self-healing hooks without threatening or leaking resource space into parent orchestrator timelines.
+## What is implemented
 
-## System Topology & Flow
-The tree topology enforces strict hierarchical propagation: parent contexts govern children, and children can fail and reconstruct without corrupting global execution roots.
+### 1. Temporal composability
 
-       [rootCtx (Standard Go Context)]
-                     │
-         [Core-Orchestrator-Agent]      <── Parent Node (Tracks Root Effects)
-                     │
-       ┌─────────────┴─────────────┐
-       │                           │
-      [Primary-Data-Subagent]      [Backup-Substitute-Subagent] <── Children Nodes
-      (Fails & self-destructs)     (Spawned via Recovery Hook)
+- `SpatioTemporalContext` provides hierarchical runtime scope.
+- `RegisterEffect` records reversible cleanup operations.
+- `Rollback` performs idempotent cascading teardown.
+- Effects are retained in LIFO order and executed through a bounded worker pool.
+- Asynchronous failures are supervised locally and can trigger recovery.
 
+### 2. Spatial composability
 
-## Key Framework Features
+- `Component` exposes `Name`, `Inject`, `OnWakeUp` and `OnSleep`.
+- `Inject()` declares runtime coeffect/dependency requirements.
+- `DependencyGraph` stores provider → dependent relationships.
+- Cycle creation is rejected atomically.
+- Wake/sleep transitions propagate through the DAG.
+- Multi-parent dependencies are reconciled according to the current implementation’s OR-style eligibility rule: one remaining active provider is sufficient.
 
-### Deadlock-Free Rollbacks: 
-Refactored lock release pattern copies context metadata and frees internal mutex structures before propagating cascades to child nodes or evaluating block metrics.
+### 3. Deterministic dependency planning
 
-### Concurrent Teardown Pipeline:
-When winding down expansive software state trees, a bounded worker pool concurrently consumes the LIFO effect channel buffer, accelerating resource release times under dense system load.
+- `PlanWake` and `PlanSleep` produce explicit `DependencyPlan` values.
+- Kahn-style traversal gives deterministic topological ordering.
+- Sleep invalidation executes downstream components before their providers.
+- Graph generations prevent stale plans from executing after a competing transition.
+- Application callbacks execute without the graph metadata lock held.
 
-### Non-Orphaned Autonomous Healing:
-Built-in traversal hooks allow failed contexts to securely consult parent trees before destruction. This ensures newly generated hot-swap substitutes are re-nested into the active living hierarchy seamlessly.
+### 4. State snapshot transfer
 
-## Directory & File Structure
+- `StatePayload` stores versioned last-known-good state.
+- `UpdateStateSnapshot` copies state into context ownership.
+- `StateSnapshot` returns an independent copy.
+- `CaptureStateSnapshot` supports application-provided state providers.
+- `TransferStateTo` and `RestoreStateSnapshot` provide explicit state handoff.
+- Snapshot tests verify isolation and concurrent updates.
 
+### 5. State-aware runtime replacement
 
-    ddsh/
-    ├── go.mod             # Go Module Declaration
-    ├── harness/
-    │   ├── context.go     # Spatiotemporal Context & Concurrent Rollback Engine
-    │   └── tracker.go     # Coeffect Evaluator & Service Dependency Tracker
-    └── main.go            # Operational Simulation Driver
+- `StateRestorer` is an optional replacement capability.
+- `RecoverWithReplacement` preserves the failed component’s logical DAG identity.
+- The replacement receives the last-known-good snapshot before activation.
+- Replacement and dependency reconciliation are serialized through the same DAG planner.
+- Invalid downstream nodes are temporarily slept and eligible nodes are reactivated without duplicate execution.
+- Repeated replacement and concurrent-transition tests protect the graph from leaks and stale recovery attempts.
 
+## Architecture
 
+```text
+                         +----------------------+
+                         |  Application         |
+                         |  Component           |
+                         +----------+-----------+
+                                    |
+                             Name() / Inject()
+                                    |
+                                    v
+                         +----------------------+
+                         | DependencyTracker    |
+                         +----------+-----------+
+                                    |
+                                    v
+                         +----------------------+
+                         | DependencyGraph      |
+                         | nodes / edges / DAG  |
+                         +----------+-----------+
+                                    |
+                       PlanWake / PlanSleep
+                                    |
+                                    v
+                         +----------------------+
+                         | DependencyPlan       |
+                         | generation + actions |
+                         +----------+-----------+
+                                    |
+                             executePlanLocked
+                                    |
+                                    v
+                    +---------------+---------------+
+                    |                               |
+                    v                               v
+          +-------------------+          +-------------------+
+          | Component         |          | ST Context        |
+          | OnWakeUp/Sleep    |          | effects/snapshot  |
+          +-------------------+          +-------------------+
+                                                    |
+                                              failure / rollback
+                                                    |
+                                                    v
+                                         +----------------------+
+                                         | RecoverWithReplacement|
+                                         +----------+-----------+
+                                                    |
+                                             state restore
+                                                    |
+                                                    v
+                                         Replacement runtime
+```
 
-## Quick Start Execution
-Verify the compilation and view the framework lifecycle output log locally by typing:
+## Repository structure
 
- `go run main.go`
+```text
+ddsh/
+├── main.go
+├── go.mod
+├── harness/
+│   ├── context.go
+│   ├── snapshot.go
+│   ├── dependency_graph.go
+│   ├── dependency_registration.go
+│   ├── dependency_plan.go
+│   ├── transition.go
+│   ├── execution_internal.go
+│   ├── tracker.go
+│   ├── recovery.go
+│   ├── replacement.go
+│   ├── replacement_atomic.go
+│   └── *_test.go
+├── .github/workflows/go.yml
+└── docs/
+    ├── README.md
+    ├── context.md
+    ├── snapshot.md
+    ├── dependency-graph.md
+    ├── dependency-registration.md
+    ├── dependency-plan.md
+    ├── transition-execution.md
+    ├── tracker.md
+    ├── recovery.md
+    ├── replacement.md
+    ├── tests.md
+    └── overall-flow.md
+```
+
+## Running the demo
+
+```sh
+go run .
+```
+
+The demo now exercises the current public architecture: component registration, dependency activation, a last-known-good snapshot, asynchronous failure, `RecoverWithReplacement`, state restoration and final hierarchical rollback.
+
+## Testing
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+```
+
+CI tests Go 1.21 and 1.22 and runs formatting validation, `go vet`, and the race-enabled test suite.
+
+## Documentation
+
+Start with [`docs/README.md`](docs/README.md), then read [`docs/overall-flow.md`](docs/overall-flow.md) for the complete runtime sequence.
+
+Each module document includes:
+
+- source file path;
+- public/internal type and function names;
+- implementation responsibilities;
+- paper/Cordis feature mapping;
+- explicit notes where `ddsh` is an approximation or extension rather than a literal upstream implementation.
+
+## Relationship to the paper
+
+The current paper describes **revertible effects**, **reactive coeffects**, a unified **context** abstraction, and dynamic composition implemented by Cordis. `ddsh` directly demonstrates the first three runtime mechanisms and adds deterministic DAG planning, generation-based stale-plan protection, state snapshots and runtime replacement as engineering mechanisms for a robust Go implementation.
+
+It does **not** reproduce the complete DeepSeek Harness product, including its web UI, profiles/bundles, session log, LLM adapters, tool pipeline, sandboxing, persistence, telemetry or declarative patch system.
+
+## License
+
+MIT
