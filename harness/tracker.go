@@ -25,9 +25,6 @@ func NewDependencyTracker(recovery RecoveryStrategy) *DependencyTracker {
 	return &DependencyTracker{graph: NewDependencyGraph(), onRecovery: recovery}
 }
 
-// Graph returns the tracker's single authoritative dependency graph. The graph
-// pointer is immutable after tracker construction, so no tracker lock is
-// required to return it.
 func (dt *DependencyTracker) Graph() *DependencyGraph { return dt.graph }
 
 func (dt *DependencyTracker) GetActiveContext(name string) *SpatioTemporalContext {
@@ -53,13 +50,21 @@ func (dt *DependencyTracker) RegisterComponentErr(parentCtx context.Context, com
 	dt.transitionMu.Lock()
 	defer dt.transitionMu.Unlock()
 	dt.clearError()
-	plan, err := dt.registerAndPlan(parentCtx, comp)
+
+	if err := dt.graph.registerComponentAtomic(comp.Name(), comp, append([]string(nil), comp.Inject()...)); err != nil {
+		dt.recordError(err)
+		return err
+	}
+	plan, err := dt.graph.PlanWake(comp.Name())
 	if err != nil {
 		dt.recordError(err)
 		return err
 	}
-	dt.executeDependencyPlan(parentCtx, plan)
-	return dt.LastErrorIfCurrent(plan.generation)
+	if err := dt.graph.ExecuteWithOptions(plan, DependencyExecutionOptions{ParentContext: parentCtx, Recovery: dt.onRecovery}); err != nil {
+		dt.recordError(err)
+		return err
+	}
+	return nil
 }
 
 func (dt *DependencyTracker) ActivateService(parentCtx context.Context, serviceName string) {
@@ -73,14 +78,18 @@ func (dt *DependencyTracker) ActivateServiceErr(parentCtx context.Context, servi
 	dt.transitionMu.Lock()
 	defer dt.transitionMu.Unlock()
 	dt.clearError()
+
 	fmt.Printf("\n📡 [Dependency Engine]: Service Registry altered -> '%s' is now ONLINE\n", serviceName)
-	plan, err := dt.graph.buildServiceTransition(serviceName, true)
+	plan, err := dt.graph.PlanWake(serviceName)
 	if err != nil {
 		dt.recordError(err)
 		return err
 	}
-	dt.executeDependencyPlan(parentCtx, plan)
-	return dt.LastErrorIfCurrent(plan.generation)
+	if err := dt.graph.ExecuteWithOptions(plan, DependencyExecutionOptions{ParentContext: parentCtx, Recovery: dt.onRecovery}); err != nil {
+		dt.recordError(err)
+		return err
+	}
+	return nil
 }
 
 func (dt *DependencyTracker) DeactivateService(serviceName string) {
@@ -94,14 +103,18 @@ func (dt *DependencyTracker) DeactivateServiceErr(serviceName string) error {
 	dt.transitionMu.Lock()
 	defer dt.transitionMu.Unlock()
 	dt.clearError()
+
 	fmt.Printf("\n🛑 [Dependency Engine]: Service Registry altered -> '%s' went OFFLINE\n", serviceName)
-	plan, err := dt.graph.buildServiceTransition(serviceName, false)
+	plan, err := dt.graph.PlanSleep(serviceName)
 	if err != nil {
 		dt.recordError(err)
 		return err
 	}
-	dt.executeDependencyPlan(context.Background(), plan)
-	return dt.LastErrorIfCurrent(plan.generation)
+	if err := dt.graph.ExecuteWithOptions(plan, DependencyExecutionOptions{ParentContext: context.Background(), Recovery: dt.onRecovery}); err != nil {
+		dt.recordError(err)
+		return err
+	}
+	return nil
 }
 
 func (dt *DependencyTracker) clearError() {
@@ -110,11 +123,23 @@ func (dt *DependencyTracker) clearError() {
 	dt.lastErr = nil
 }
 
+func (dt *DependencyTracker) LastError() error {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	return dt.lastErr
+}
+
+// LastErrorIfCurrent remains as a compatibility helper. Plan execution now
+// performs generation validation itself.
 func (dt *DependencyTracker) LastErrorIfCurrent(generation uint64) error {
 	if dt.graph.Generation() != generation {
 		return nil
 	}
+	return dt.LastError()
+}
+
+func (dt *DependencyTracker) recordError(err error) {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
-	return dt.lastErr
+	dt.lastErr = err
 }
