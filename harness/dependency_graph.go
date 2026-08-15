@@ -27,7 +27,6 @@ type dependencyNode struct {
 	active     bool
 }
 
-// dependencyEdge represents one provider -> dependent relationship.
 type dependencyEdge struct {
 	provider  string
 	dependent string
@@ -38,16 +37,17 @@ type dependencyEdgeKey struct {
 	dependent string
 }
 
-// DependencyGraph is the structural dependency DAG. Its lock protects only
-// graph metadata/state and is independent from SpatioTemporalContext.mu.
+// DependencyGraph is the structural dependency DAG. mu protects graph
+// metadata/state. planMu serializes state transitions with plan execution;
+// callbacks never run while mu is held.
 type DependencyGraph struct {
-	mu    sync.RWMutex
-	nodes map[string]*dependencyNode
-	edges map[dependencyEdgeKey]*dependencyEdge
+	mu         sync.RWMutex
+	planMu     sync.Mutex
+	nodes      map[string]*dependencyNode
+	edges      map[dependencyEdgeKey]*dependencyEdge
+	generation uint64
 }
 
-// DependencyNodeInfo is a lock-safe snapshot of node metadata. Internal maps
-// and slices never escape the graph.
 type DependencyNodeInfo struct {
 	Name      string
 	Component Component
@@ -62,27 +62,28 @@ func NewDependencyGraph() *DependencyGraph {
 	}
 }
 
-// RegisterNode adds a node. Edges are registered separately so edge insertion
-// can be validated transactionally.
 func (g *DependencyGraph) RegisterNode(name string, component Component, ctx *SpatioTemporalContext) error {
 	if err := validateDependencyNodeName(name); err != nil {
 		return err
 	}
+	g.planMu.Lock()
+	defer g.planMu.Unlock()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if _, ok := g.nodes[name]; ok {
 		return fmt.Errorf("%w: %q", ErrDependencyNodeExists, name)
 	}
 	g.nodes[name] = &dependencyNode{
-		name: name, component: component, context: ctx,
-		providers: make(map[string]*dependencyEdge),
+		name:       name,
+		component:  component,
+		context:    ctx,
+		providers:  make(map[string]*dependencyEdge),
 		dependents: make(map[string]*dependencyEdge),
 	}
+	g.generation++
 	return nil
 }
 
-// RegisterDependency adds provider -> dependent. Both endpoints must already
-// exist. A duplicate is a successful no-op. A cycle leaves the graph unchanged.
 func (g *DependencyGraph) RegisterDependency(provider, dependent string) error {
 	if err := validateDependencyNodeName(provider); err != nil {
 		return fmt.Errorf("provider: %w", err)
@@ -90,7 +91,8 @@ func (g *DependencyGraph) RegisterDependency(provider, dependent string) error {
 	if err := validateDependencyNodeName(dependent); err != nil {
 		return fmt.Errorf("dependent: %w", err)
 	}
-
+	g.planMu.Lock()
+	defer g.planMu.Unlock()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -102,14 +104,10 @@ func (g *DependencyGraph) RegisterDependency(provider, dependent string) error {
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrDependencyNodeNotFound, dependent)
 	}
-
 	key := dependencyEdgeKey{provider: provider, dependent: dependent}
 	if _, ok := g.edges[key]; ok {
 		return nil
 	}
-
-	// provider -> dependent is cyclic exactly when dependent can already
-	// reach provider. Search the existing graph before mutating anything.
 	if path := g.findPathLocked(dependent, provider); len(path) != 0 {
 		cycle := append([]string{provider}, path...)
 		return fmt.Errorf("%w: %s", ErrDependencyCycle, strings.Join(cycle, " -> "))
@@ -119,19 +117,25 @@ func (g *DependencyGraph) RegisterDependency(provider, dependent string) error {
 	g.edges[key] = edge
 	p.dependents[dependent] = edge
 	d.providers[provider] = edge
+	g.generation++
 	return nil
 }
 
 // SetNodeActive changes graph activity metadata only; it does not execute the
-// component or context.
+// component or context. A real state change advances the graph generation.
 func (g *DependencyGraph) SetNodeActive(name string, active bool) error {
+	g.planMu.Lock()
+	defer g.planMu.Unlock()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	node, ok := g.nodes[name]
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrDependencyNodeNotFound, name)
 	}
-	node.active = active
+	if node.active != active {
+		node.active = active
+		g.generation++
+	}
 	return nil
 }
 
@@ -149,7 +153,6 @@ func (g *DependencyGraph) HasDependency(provider, dependent string) bool {
 	return ok
 }
 
-// Nodes returns a sorted metadata snapshot.
 func (g *DependencyGraph) Nodes() []DependencyNodeInfo {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -170,7 +173,9 @@ func (g *DependencyGraph) Node(name string) (DependencyNodeInfo, bool) {
 	if !ok {
 		return DependencyNodeInfo{}, false
 	}
-	return DependencyNodeInfo{Name: node.name, Component: node.component, Context: node.context, Active: node.active}, true
+	return DependencyNodeInfo{
+		Name: node.name, Component: node.component, Context: node.context, Active: node.active,
+	}, true
 }
 
 func (g *DependencyGraph) DependenciesOf(name string) ([]string, error) {
@@ -209,16 +214,12 @@ func (g *DependencyGraph) EdgeCount() int {
 	return len(g.edges)
 }
 
-// Validate checks node metadata, endpoint existence, both directions of every
-// edge, edge-index consistency, and acyclicity.
 func (g *DependencyGraph) Validate() error {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.validateLocked()
 }
 
-// TopologicalOrder returns providers before their dependents. Independent
-// nodes are ordered by name for deterministic results.
 func (g *DependencyGraph) TopologicalOrder() ([]string, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -263,6 +264,12 @@ func (g *DependencyGraph) TopologicalOrder() ([]string, error) {
 		return nil, ErrDependencyCycle
 	}
 	return order, nil
+}
+
+func (g *DependencyGraph) Generation() uint64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.generation
 }
 
 func validateDependencyNodeName(name string) error {
