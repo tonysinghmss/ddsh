@@ -299,13 +299,8 @@ func (dt *DependencyTracker) executeDependencyPlan(parentCtx context.Context, pl
 		dt.recordError(err)
 		return
 	}
-
-	// planMu is the graph's transition/execution serialization boundary. It is
-	// deliberately held without g.mu, so callbacks can safely re-enter graph
-	// queries and context operations without lock inversion.
 	dt.graph.planMu.Lock()
 	defer dt.graph.planMu.Unlock()
-
 	for _, step := range plan.steps {
 		if !dt.planCurrent(plan.generation) {
 			return
@@ -344,15 +339,15 @@ func (dt *DependencyTracker) executeSleepStep(step ExecutionStep) {
 }
 
 func (dt *DependencyTracker) registerAndPlan(parentCtx context.Context, comp Component) (DependencyPlan, error) {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
 	if err := dt.graph.registerComponentAtomic(comp.Name(), comp, append([]string(nil), comp.Inject()...)); err != nil {
 		return DependencyPlan{}, err
 	}
-	return dt.reconcileNewRegistrationLocked(parentCtx, comp.Name())
+	return dt.reconcileNewRegistration(parentCtx, comp.Name())
 }
 
-func (dt *DependencyTracker) reconcileNewRegistrationLocked(_ context.Context, name string) (DependencyPlan, error) {
+func (dt *DependencyTracker) reconcileNewRegistration(_ context.Context, name string) (DependencyPlan, error) {
+	dt.graph.planMu.Lock()
+	defer dt.graph.planMu.Unlock()
 	dt.graph.mu.Lock()
 	defer dt.graph.mu.Unlock()
 	node := dt.graph.nodes[name]
