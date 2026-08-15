@@ -14,19 +14,16 @@ type Component interface {
 }
 
 type DependencyTracker struct {
-	mu          sync.Mutex
+	mu           sync.Mutex
 	transitionMu sync.Mutex
-	graph       *DependencyGraph
-	onRecovery  RecoveryStrategy
-	generation  uint64
-	lastErr     error
+	graph        *DependencyGraph
+	onRecovery   RecoveryStrategy
+	generation   uint64
+	lastErr      error
 }
 
 func NewDependencyTracker(recovery RecoveryStrategy) *DependencyTracker {
-	return &DependencyTracker{
-		graph:      NewDependencyGraph(),
-		onRecovery: recovery,
-	}
+	return &DependencyTracker{graph: NewDependencyGraph(), onRecovery: recovery}
 }
 
 // Graph returns the tracker's single authoritative dependency graph.
@@ -46,12 +43,14 @@ func (dt *DependencyTracker) GetActiveContext(name string) *SpatioTemporalContex
 }
 
 // RegisterComponent preserves the original public API. Registration errors are
-// available through LastError; RegisterComponentErr provides an explicit-error
-// compatibility API for callers that want transactional failure reporting.
+// available through LastError; RegisterComponentErr provides explicit failure
+// reporting without breaking existing callers.
 func (dt *DependencyTracker) RegisterComponent(parentCtx context.Context, comp Component) {
 	if err := dt.RegisterComponentErr(parentCtx, comp); err != nil {
 		dt.recordError(err)
-		fmt.Printf("[Tracker]: failed to register component '%s': %v\n", comp.Name(), err)
+		if comp != nil {
+			fmt.Printf("[Tracker]: failed to register component '%s': %v\n", comp.Name(), err)
+		}
 	}
 }
 
@@ -61,6 +60,7 @@ func (dt *DependencyTracker) RegisterComponentErr(parentCtx context.Context, com
 	}
 	dt.transitionMu.Lock()
 	defer dt.transitionMu.Unlock()
+	dt.clearError()
 
 	plan, err := dt.registerAndPlan(parentCtx, comp)
 	if err != nil {
@@ -81,7 +81,7 @@ func (dt *DependencyTracker) ActivateService(parentCtx context.Context, serviceN
 func (dt *DependencyTracker) ActivateServiceErr(parentCtx context.Context, serviceName string) error {
 	dt.transitionMu.Lock()
 	defer dt.transitionMu.Unlock()
-
+	dt.clearError()
 	dt.mu.Lock()
 	dt.generation++
 	generation := dt.generation
@@ -107,7 +107,7 @@ func (dt *DependencyTracker) DeactivateService(serviceName string) {
 func (dt *DependencyTracker) DeactivateServiceErr(serviceName string) error {
 	dt.transitionMu.Lock()
 	defer dt.transitionMu.Unlock()
-
+	dt.clearError()
 	dt.mu.Lock()
 	dt.generation++
 	generation := dt.generation
@@ -121,6 +121,12 @@ func (dt *DependencyTracker) DeactivateServiceErr(serviceName string) error {
 	}
 	dt.executeDependencyPlan(context.Background(), plan)
 	return dt.LastErrorIfCurrent(plan.generation)
+}
+
+func (dt *DependencyTracker) clearError() {
+	dt.mu.Lock()
+	dt.lastErr = nil
+	dt.mu.Unlock()
 }
 
 func (dt *DependencyTracker) LastErrorIfCurrent(generation uint64) error {
