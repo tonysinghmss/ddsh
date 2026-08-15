@@ -17,8 +17,8 @@ The tree topology enforces strict hierarchical propagation: parent contexts gove
                      │
        ┌─────────────┴─────────────┐
        │                           │
- [Primary-Data-Subagent]      [Backup-Substitute-Subagent] <── Children Nodes
- (Fails & self-destructs)  (Spawned via Recovery Hook)
+      [Primary-Data-Subagent]      [Backup-Substitute-Subagent] <── Children Nodes
+      (Fails & self-destructs)     (Spawned via Recovery Hook)
 
 
 ## Key Framework Features
@@ -35,12 +35,13 @@ Built-in traversal hooks allow failed contexts to securely consult parent trees 
 ## Directory & File Structure
 
 
-ddsh/
-├── go.mod             # Go Module Declaration
-├── harness/
-│   ├── context.go     # Spatiotemporal Context & Concurrent Rollback Engine
-│   └── tracker.go     # Coeffect Evaluator & Service Dependency Tracker
-└── main.go            # Operational Simulation Driver
+    ddsh/
+    ├── go.mod             # Go Module Declaration
+    ├── harness/
+    │   ├── context.go     # Spatiotemporal Context & Concurrent Rollback Engine
+    │   └── tracker.go     # Coeffect Evaluator & Service Dependency Tracker
+    └── main.go            # Operational Simulation Driver
+
 
 
 ## Quick Start Execution
