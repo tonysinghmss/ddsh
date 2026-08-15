@@ -9,11 +9,7 @@ import (
 // registerComponentAtomic adds a component and all previously unknown provider
 // nodes as one graph transaction. No graph mutation occurs when any new edge
 // would introduce a cycle.
-func (g *DependencyGraph) registerComponentAtomic(
-	name string,
-	component Component,
-	requirements []string,
-) error {
+func (g *DependencyGraph) registerComponentAtomic(name string, component Component, requirements []string) error {
 	if err := validateDependencyNodeName(name); err != nil {
 		return err
 	}
@@ -26,11 +22,11 @@ func (g *DependencyGraph) registerComponentAtomic(
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if _, exists := g.nodes[name]; exists {
+	existing, exists := g.nodes[name]
+	if exists && existing.component != nil {
 		return fmt.Errorf("%w: %q", ErrDependencyNodeExists, name)
 	}
 
-	// Validate the hypothetical topology before mutating either nodes or edges.
 	adj := make(map[string]map[string]struct{}, len(g.nodes)+len(requirements))
 	for nodeName, node := range g.nodes {
 		adj[nodeName] = make(map[string]struct{}, len(node.dependents))
@@ -51,6 +47,16 @@ func (g *DependencyGraph) registerComponentAtomic(
 		return fmt.Errorf("%w: %s", ErrDependencyCycle, joinPath(cycle))
 	}
 
+	if !exists {
+		g.nodes[name] = &dependencyNode{
+			name: name,
+			component: component,
+			providers: make(map[string]*dependencyEdge),
+			dependents: make(map[string]*dependencyEdge),
+		}
+	} else {
+		existing.component = component
+	}
 	for provider := range adj {
 		if _, exists := g.nodes[provider]; exists {
 			continue
@@ -61,14 +67,11 @@ func (g *DependencyGraph) registerComponentAtomic(
 			dependents: make(map[string]*dependencyEdge),
 		}
 	}
-	g.nodes[name] = &dependencyNode{
-		name: name,
-		component: component,
-		providers: make(map[string]*dependencyEdge),
-		dependents: make(map[string]*dependencyEdge),
-	}
 	for _, provider := range requirements {
 		key := dependencyEdgeKey{provider: provider, dependent: name}
+		if _, exists := g.edges[key]; exists {
+			continue
+		}
 		edge := &dependencyEdge{provider: provider, dependent: name}
 		g.edges[key] = edge
 		g.nodes[provider].dependents[name] = edge
@@ -77,8 +80,6 @@ func (g *DependencyGraph) registerComponentAtomic(
 	return nil
 }
 
-// ensureProviderLocked creates a service/provider node without changing any
-// component topology. The caller must hold g.mu.
 func (g *DependencyGraph) ensureProviderLocked(name string) error {
 	if err := validateDependencyNodeName(name); err != nil {
 		return err
@@ -86,32 +87,22 @@ func (g *DependencyGraph) ensureProviderLocked(name string) error {
 	if _, ok := g.nodes[name]; ok {
 		return nil
 	}
-	g.nodes[name] = &dependencyNode{
-		name: name,
-		providers: make(map[string]*dependencyEdge),
-		dependents: make(map[string]*dependencyEdge),
-	}
+	g.nodes[name] = &dependencyNode{name: name, providers: make(map[string]*dependencyEdge), dependents: make(map[string]*dependencyEdge)}
 	return nil
 }
 
-// buildServiceTransition atomically updates graph activity and returns an
-// immutable plan. The graph lock is released before the plan is executed.
-func (g *DependencyGraph) buildServiceTransition(
-	serviceName string,
-	active bool,
-	generation uint64,
-) (DependencyPlan, error) {
+// buildServiceTransition atomically updates graph activity and returns an immutable plan.
+// The graph lock is released before the plan is executed.
+func (g *DependencyGraph) buildServiceTransition(serviceName string, active bool, generation uint64) (DependencyPlan, error) {
 	if err := validateDependencyNodeName(serviceName); err != nil {
 		return DependencyPlan{}, err
 	}
-
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	if err := g.ensureProviderLocked(serviceName); err != nil {
 		return DependencyPlan{}, err
 	}
-
 	trigger := g.nodes[serviceName]
 	if trigger.active == active {
 		return DependencyPlan{kind: executionKind(active), generation: generation}, nil
@@ -121,20 +112,12 @@ func (g *DependencyGraph) buildServiceTransition(
 	if err != nil {
 		return DependencyPlan{}, err
 	}
-	position := make(map[string]int, len(order))
-	for i, name := range order {
-		position[name] = i
-	}
-
 	steps := make([]ExecutionStep, 0)
 	if active {
 		trigger.active = true
 		for _, name := range order {
 			node := g.nodes[name]
-			if node.active || node.component == nil || !g.allProvidersActiveLocked(node) {
-				continue
-			}
-			if !g.reachableFromLocked(serviceName, name) {
+			if node.active || node.component == nil || !g.allProvidersActiveLocked(node) || !g.reachableFromLocked(serviceName, name) {
 				continue
 			}
 			node.active = true
@@ -156,11 +139,11 @@ func (g *DependencyGraph) buildServiceTransition(
 			}
 		}
 		for name := range seen {
-			if node := g.nodes[name]; node != nil && node.active && node.component != nil && !g.allProvidersActiveLocked(node) {
+			node := g.nodes[name]
+			if node != nil && node.active && node.component != nil && !g.allProvidersActiveLocked(node) {
 				candidates[name] = struct{}{}
 			}
 		}
-		// Reverse topological order guarantees dependents sleep before their providers.
 		for i := len(order) - 1; i >= 0; i-- {
 			name := order[i]
 			if _, ok := candidates[name]; !ok {
@@ -170,50 +153,35 @@ func (g *DependencyGraph) buildServiceTransition(
 			node.active = false
 			steps = append(steps, ExecutionStep{Name: name, Component: node.component, Context: node.context})
 		}
-		_ = position
 	}
-
 	return DependencyPlan{kind: executionKind(active), generation: generation, steps: steps}, nil
 }
 
 func executionKind(active bool) ExecutionKind {
-	if active {
-		return ExecutionWake
-	}
+	if active { return ExecutionWake }
 	return ExecutionSleep
 }
 
 func (g *DependencyGraph) allProvidersActiveLocked(node *dependencyNode) bool {
 	for provider := range node.providers {
-		if !g.nodes[provider].active {
-			return false
-		}
+		if !g.nodes[provider].active { return false }
 	}
 	return true
 }
 
 func (g *DependencyGraph) reachableFromLocked(from, target string) bool {
-	if from == target {
-		return true
-	}
+	if from == target { return true }
 	queue := []string{from}
 	seen := map[string]bool{from: true}
 	for len(queue) > 0 {
 		name := queue[0]
 		queue = queue[1:]
 		neighbors := make([]string, 0, len(g.nodes[name].dependents))
-		for dependent := range g.nodes[name].dependents {
-			neighbors = append(neighbors, dependent)
-		}
+		for dependent := range g.nodes[name].dependents { neighbors = append(neighbors, dependent) }
 		sort.Strings(neighbors)
 		for _, dependent := range neighbors {
-			if dependent == target {
-				return true
-			}
-			if !seen[dependent] {
-				seen[dependent] = true
-				queue = append(queue, dependent)
-			}
+			if dependent == target { return true }
+			if !seen[dependent] { seen[dependent] = true; queue = append(queue, dependent) }
 		}
 	}
 	return false
@@ -221,18 +189,10 @@ func (g *DependencyGraph) reachableFromLocked(from, target string) bool {
 
 func (g *DependencyGraph) topologicalOrderLocked() ([]string, error) {
 	indegree := make(map[string]int, len(g.nodes))
-	for name := range g.nodes {
-		indegree[name] = 0
-	}
-	for _, edge := range g.edges {
-		indegree[edge.dependent]++
-	}
+	for name := range g.nodes { indegree[name] = 0 }
+	for _, edge := range g.edges { indegree[edge.dependent]++ }
 	ready := make([]string, 0)
-	for name, degree := range indegree {
-		if degree == 0 {
-			ready = append(ready, name)
-		}
-	}
+	for name, degree := range indegree { if degree == 0 { ready = append(ready, name) } }
 	sort.Strings(ready)
 	order := make([]string, 0, len(g.nodes))
 	for len(ready) > 0 {
@@ -240,30 +200,19 @@ func (g *DependencyGraph) topologicalOrderLocked() ([]string, error) {
 		ready = ready[1:]
 		order = append(order, name)
 		neighbors := make([]string, 0, len(g.nodes[name].dependents))
-		for dependent := range g.nodes[name].dependents {
-			neighbors = append(neighbors, dependent)
-		}
+		for dependent := range g.nodes[name].dependents { neighbors = append(neighbors, dependent) }
 		sort.Strings(neighbors)
 		for _, dependent := range neighbors {
 			indegree[dependent]--
-			if indegree[dependent] == 0 {
-				ready = append(ready, dependent)
-				sort.Strings(ready)
-			}
+			if indegree[dependent] == 0 { ready = append(ready, dependent); sort.Strings(ready) }
 		}
 	}
-	if len(order) != len(g.nodes) {
-		return nil, ErrDependencyCycle
-	}
+	if len(order) != len(g.nodes) { return nil, ErrDependencyCycle }
 	return order, nil
 }
 
 func findCycleInAdjacency(adj map[string]map[string]struct{}) []string {
-	const (
-		white uint8 = iota
-		gray
-		black
-	)
+	const ( white uint8 = iota; gray; black )
 	state := make(map[string]uint8, len(adj))
 	stack := make([]string, 0, len(adj))
 	var visit func(string) []string
@@ -271,68 +220,35 @@ func findCycleInAdjacency(adj map[string]map[string]struct{}) []string {
 		state[node] = gray
 		stack = append(stack, node)
 		neighbors := make([]string, 0, len(adj[node]))
-		for next := range adj[node] {
-			neighbors = append(neighbors, next)
-		}
+		for next := range adj[node] { neighbors = append(neighbors, next) }
 		sort.Strings(neighbors)
 		for _, next := range neighbors {
 			switch state[next] {
 			case gray:
-				for i := range stack {
-					if stack[i] == next {
-						return append(append([]string(nil), stack[i:]...), next)
-					}
-				}
+				for i := range stack { if stack[i] == next { return append(append([]string(nil), stack[i:]...), next) } }
 			case white:
-				if cycle := visit(next); len(cycle) != 0 {
-					return cycle
-				}
+				if cycle := visit(next); len(cycle) != 0 { return cycle }
 			}
 		}
 		stack = stack[:len(stack)-1]
 		state[node] = black
 		return nil
 	}
-	for node := range adj {
-		if state[node] == white {
-			if cycle := visit(node); len(cycle) != 0 {
-				return cycle
-			}
-		}
-	}
+	for node := range adj { if state[node] == white { if cycle := visit(node); len(cycle) != 0 { return cycle } } }
 	return nil
 }
 
 func joinPath(path []string) string {
 	result := ""
-	for i, name := range path {
-		if i > 0 {
-			result += " -> "
-		}
-		result += name
-	}
+	for i, name := range path { if i > 0 { result += " -> " }; result += name }
 	return result
 }
 
-// executeDependencyPlan invokes application callbacks only after the graph
-// lock has been released. It also reconciles stale plans before each step.
-func (dt *DependencyTracker) executeDependencyPlan(
-	parentCtx context.Context,
-	plan DependencyPlan,
-) {
-	if err := plan.validate(); err != nil {
-		dt.recordError(err)
-		return
-	}
+func (dt *DependencyTracker) executeDependencyPlan(parentCtx context.Context, plan DependencyPlan) {
+	if err := plan.validate(); err != nil { dt.recordError(err); return }
 	for _, step := range plan.steps {
-		if !dt.planCurrent(plan.generation) {
-			return
-		}
-		if plan.kind == ExecutionWake {
-			dt.executeWakeStep(parentCtx, step)
-		} else {
-			dt.executeSleepStep(step)
-		}
+		if !dt.planCurrent(plan.generation) { return }
+		if plan.kind == ExecutionWake { dt.executeWakeStep(parentCtx, step) } else { dt.executeSleepStep(step) }
 	}
 }
 
@@ -341,9 +257,7 @@ func (dt *DependencyTracker) executeWakeStep(parentCtx context.Context, step Exe
 	if ctx == nil {
 		ctx = NewSTContext(parentCtx, step.Name, dt.onRecovery)
 		dt.graph.mu.Lock()
-		if node := dt.graph.nodes[step.Name]; node != nil {
-			node.context = ctx
-		}
+		if node := dt.graph.nodes[step.Name]; node != nil { node.context = ctx }
 		dt.graph.mu.Unlock()
 	}
 	step.Component.OnWakeUp(ctx)
@@ -351,34 +265,21 @@ func (dt *DependencyTracker) executeWakeStep(parentCtx context.Context, step Exe
 
 func (dt *DependencyTracker) executeSleepStep(step ExecutionStep) {
 	step.Component.OnSleep()
-	if step.Context != nil {
-		step.Context.Rollback()
-	}
+	if step.Context != nil { step.Context.Rollback() }
 	dt.graph.mu.Lock()
-	if node := dt.graph.nodes[step.Name]; node != nil {
-		node.context = nil
-	}
+	if node := dt.graph.nodes[step.Name]; node != nil { node.context = nil }
 	dt.graph.mu.Unlock()
 }
 
-// registerAndPlan handles registration without holding the tracker lock while
-// component callbacks execute.
-func (dt *DependencyTracker) registerAndPlan(
-	parentCtx context.Context,
-	comp Component,
-) (DependencyPlan, error) {
+func (dt *DependencyTracker) registerAndPlan(parentCtx context.Context, comp Component) (DependencyPlan, error) {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
-	if err := dt.graph.registerComponentAtomic(comp.Name(), comp, append([]string(nil), comp.Inject()...)); err != nil {
-		return DependencyPlan{}, err
-	}
+	if err := dt.graph.registerComponentAtomic(comp.Name(), comp, append([]string(nil), comp.Inject()...)); err != nil { return DependencyPlan{}, err }
 	dt.generation++
 	return dt.reconcileNewRegistrationLocked(parentCtx, comp.Name())
 }
 
 func (dt *DependencyTracker) reconcileNewRegistrationLocked(_ context.Context, name string) (DependencyPlan, error) {
-	// Graph activity is already authoritative. Registration can only newly
-	// enable this component; all of its providers must already be active.
 	dt.graph.mu.Lock()
 	defer dt.graph.mu.Unlock()
 	node := dt.graph.nodes[name]
@@ -386,11 +287,7 @@ func (dt *DependencyTracker) reconcileNewRegistrationLocked(_ context.Context, n
 		return DependencyPlan{kind: ExecutionWake, generation: dt.generation}, nil
 	}
 	node.active = true
-	return DependencyPlan{
-		kind: ExecutionWake,
-		generation: dt.generation,
-		steps: []ExecutionStep{{Name: name, Component: node.component, Context: node.context}},
-	}, nil
+	return DependencyPlan{kind: ExecutionWake, generation: dt.generation, steps: []ExecutionStep{{Name: name, Component: node.component, Context: node.context}}}, nil
 }
 
 func (dt *DependencyTracker) planCurrent(generation uint64) bool {
@@ -405,9 +302,6 @@ func (dt *DependencyTracker) recordError(err error) {
 	dt.mu.Unlock()
 }
 
-// LastError returns the most recent lifecycle/registration error observed by
-// the tracker. Existing lifecycle methods remain source-compatible and expose
-// errors through this compatibility accessor.
 func (dt *DependencyTracker) LastError() error {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
