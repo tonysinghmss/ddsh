@@ -8,97 +8,126 @@ import (
 
 type Component interface {
 	Name() string
-	Inject() []string                            
-	OnWakeUp(ctx *SpatioTemporalContext)         
-	OnSleep()                                    
+	Inject() []string
+	OnWakeUp(ctx *SpatioTemporalContext)
+	OnSleep()
 }
 
 type DependencyTracker struct {
 	mu          sync.Mutex
-	services    map[string]bool
-	components  map[string]Component
-	activeCtxs  map[string]*SpatioTemporalContext
+	transitionMu sync.Mutex
+	graph       *DependencyGraph
 	onRecovery  RecoveryStrategy
+	generation  uint64
+	lastErr     error
 }
 
 func NewDependencyTracker(recovery RecoveryStrategy) *DependencyTracker {
 	return &DependencyTracker{
-		services:   make(map[string]bool),
-		components: make(map[string]Component),
-		activeCtxs: make(map[string]*SpatioTemporalContext),
+		graph:      NewDependencyGraph(),
 		onRecovery: recovery,
 	}
+}
+
+// Graph returns the tracker's single authoritative dependency graph.
+func (dt *DependencyTracker) Graph() *DependencyGraph {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	return dt.graph
 }
 
 func (dt *DependencyTracker) GetActiveContext(name string) *SpatioTemporalContext {
 	dt.mu.Lock()
 	defer dt.mu.Unlock()
-	return dt.activeCtxs[name]
+	if node, ok := dt.graph.Node(name); ok && node.Active {
+		return node.Context
+	}
+	return nil
 }
 
+// RegisterComponent preserves the original public API. Registration errors are
+// available through LastError; RegisterComponentErr provides an explicit-error
+// compatibility API for callers that want transactional failure reporting.
 func (dt *DependencyTracker) RegisterComponent(parentCtx context.Context, comp Component) {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
-	dt.components[comp.Name()] = comp
-	dt.evaluateComponentState(parentCtx, comp)
+	if err := dt.RegisterComponentErr(parentCtx, comp); err != nil {
+		dt.recordError(err)
+		fmt.Printf("[Tracker]: failed to register component '%s': %v\n", comp.Name(), err)
+	}
+}
+
+func (dt *DependencyTracker) RegisterComponentErr(parentCtx context.Context, comp Component) error {
+	if comp == nil {
+		return fmt.Errorf("component is nil")
+	}
+	dt.transitionMu.Lock()
+	defer dt.transitionMu.Unlock()
+
+	plan, err := dt.registerAndPlan(parentCtx, comp)
+	if err != nil {
+		dt.recordError(err)
+		return err
+	}
+	dt.executeDependencyPlan(parentCtx, plan)
+	return dt.LastErrorIfCurrent(plan.generation)
 }
 
 func (dt *DependencyTracker) ActivateService(parentCtx context.Context, serviceName string) {
+	if err := dt.ActivateServiceErr(parentCtx, serviceName); err != nil {
+		dt.recordError(err)
+		fmt.Printf("[Tracker]: failed to activate service '%s': %v\n", serviceName, err)
+	}
+}
+
+func (dt *DependencyTracker) ActivateServiceErr(parentCtx context.Context, serviceName string) error {
+	dt.transitionMu.Lock()
+	defer dt.transitionMu.Unlock()
+
 	dt.mu.Lock()
-	defer dt.mu.Unlock()
+	dt.generation++
+	generation := dt.generation
+	dt.mu.Unlock()
 
 	fmt.Printf("\n📡 [Dependency Engine]: Service Registry altered -> '%s' is now ONLINE\n", serviceName)
-	dt.services[serviceName] = true
-
-	for _, comp := range dt.components {
-		dt.evaluateComponentState(parentCtx, comp)
+	plan, err := dt.graph.buildServiceTransition(serviceName, true, generation)
+	if err != nil {
+		dt.recordError(err)
+		return err
 	}
+	dt.executeDependencyPlan(parentCtx, plan)
+	return dt.LastErrorIfCurrent(plan.generation)
 }
 
 func (dt *DependencyTracker) DeactivateService(serviceName string) {
-	dt.mu.Lock()
-
-	var contextsToRollback []*SpatioTemporalContext
-	var componentsToSleep []Component
-
-	fmt.Printf("\n🛑 [Dependency Engine]: Service Registry altered -> '%s' went OFFLINE\n", serviceName)
-	dt.services[serviceName] = false
-
-	for _, comp := range dt.components {
-		for _, req := range comp.Inject() {
-			if req == serviceName {
-				if stCtx, active := dt.activeCtxs[comp.Name()]; active {
-					componentsToSleep = append(componentsToSleep, comp)
-					contextsToRollback = append(contextsToRollback, stCtx)
-					delete(dt.activeCtxs, comp.Name())
-				}
-			}
-		}
-	}
-	dt.mu.Unlock() 
-
-	for i, comp := range componentsToSleep {
-		fmt.Printf("[Tracker]: Dependency severed for '%s'. Transitioning to SLEEP...\n", comp.Name())
-		comp.OnSleep()
-		contextsToRollback[i].Rollback()
+	if err := dt.DeactivateServiceErr(serviceName); err != nil {
+		dt.recordError(err)
+		fmt.Printf("[Tracker]: failed to deactivate service '%s': %v\n", serviceName, err)
 	}
 }
 
-func (dt *DependencyTracker) evaluateComponentState(parentCtx context.Context, comp Component) {
-	if _, active := dt.activeCtxs[comp.Name()]; active {
-		return
-	}
+func (dt *DependencyTracker) DeactivateServiceErr(serviceName string) error {
+	dt.transitionMu.Lock()
+	defer dt.transitionMu.Unlock()
 
-	for _, req := range comp.Inject() {
-		if !dt.services[req] {
-			fmt.Printf("[Tracker]: Component '%s' remains ASLEEP. Missing required coeffect: '%s'\n", comp.Name(), req)
-			return
-		}
-	}
+	dt.mu.Lock()
+	dt.generation++
+	generation := dt.generation
+	dt.mu.Unlock()
 
-	fmt.Printf("[Tracker]: Spatial coeffects aligned for '%s'. Transitioning to WAKE UP...\n", comp.Name())
-	stCtx := NewSTContext(parentCtx, comp.Name(), dt.onRecovery)
-	dt.activeCtxs[comp.Name()] = stCtx
-	
-	go comp.OnWakeUp(stCtx)
+	fmt.Printf("\n🛑 [Dependency Engine]: Service Registry altered -> '%s' went OFFLINE\n", serviceName)
+	plan, err := dt.graph.buildServiceTransition(serviceName, false, generation)
+	if err != nil {
+		dt.recordError(err)
+		return err
+	}
+	dt.executeDependencyPlan(context.Background(), plan)
+	return dt.LastErrorIfCurrent(plan.generation)
+}
+
+func (dt *DependencyTracker) LastErrorIfCurrent(generation uint64) error {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	if dt.generation != generation {
+		return nil
+	}
+	return dt.lastErr
 }
