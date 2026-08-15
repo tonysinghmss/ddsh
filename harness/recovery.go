@@ -22,10 +22,9 @@ var (
 // failed context's last-known-good snapshot before the graph transition is
 // reconciled.
 //
-// Graph mutation is atomic from the dependency engine's perspective. Any
-// downstream nodes invalidated by the replacement are slept and then woken
-// through the normal dependency planner; recovery does not invoke child
-// callbacks directly.
+// Graph replacement and dependency reconciliation are serialized as one graph
+// transition. Downstream callbacks are always reached through the dependency
+// planner rather than direct recovery callback chains.
 func (dt *DependencyTracker) RecoverWithReplacement(parentCtx context.Context, failedName string, replacement Component) error {
 	if replacement == nil {
 		return fmt.Errorf("%w: nil replacement", ErrReplacementUnavailable)
@@ -34,17 +33,13 @@ func (dt *DependencyTracker) RecoverWithReplacement(parentCtx context.Context, f
 		return fmt.Errorf("%w: failed=%q replacement=%q", ErrReplacementNameMismatch, failedName, replacement.Name())
 	}
 
-	dt.transitionMu.Lock()
-	defer dt.transitionMu.Unlock()
 	dt.clearError()
-
 	node, ok := dt.graph.Node(failedName)
 	if !ok || node.Component == nil {
 		err := fmt.Errorf("%w: %q", ErrReplacementUnavailable, failedName)
 		dt.recordError(err)
 		return err
 	}
-
 	failedCtx := node.Context
 	if failedCtx == nil {
 		err := fmt.Errorf("%w: no failed context for %q", ErrReplacementUnavailable, failedName)
@@ -57,7 +52,6 @@ func (dt *DependencyTracker) RecoverWithReplacement(parentCtx context.Context, f
 		dt.recordError(err)
 		return err
 	}
-
 	if parentCtx == nil {
 		parentCtx = context.Background()
 	}
@@ -68,8 +62,8 @@ func (dt *DependencyTracker) RecoverWithReplacement(parentCtx context.Context, f
 	replacementCtx := NewSTContext(parentCtx, failedName, dt.onRecovery)
 	replacementCtx.RestoreStateSnapshot(payload)
 
-	// Application restore code is deliberately outside tracker/graph/context
-	// locks so it may acquire component-local locks safely.
+	// Application restore code executes before graph mutation and without any
+	// tracker, graph, or context lock held.
 	if restorer, ok := replacement.(StateRestorer); ok {
 		if err := restorer.RestoreState(payload.clone()); err != nil {
 			replacementCtx.Rollback()
@@ -78,14 +72,16 @@ func (dt *DependencyTracker) RecoverWithReplacement(parentCtx context.Context, f
 		}
 	}
 
-	plan, err := dt.graph.replaceNodeRuntime(failedName, replacement, replacementCtx)
+	dt.graph.planMu.Lock()
+	defer dt.graph.planMu.Unlock()
+
+	plan, err := dt.graph.replaceNodeRuntimeUnlocked(failedName, replacement, replacementCtx)
 	if err != nil {
 		replacementCtx.Rollback()
 		dt.recordError(err)
 		return err
 	}
-
-	if err := dt.graph.ExecuteWithOptions(plan, DependencyExecutionOptions{ParentContext: parentCtx, Recovery: dt.onRecovery}); err != nil {
+	if err := dt.graph.executePlanLocked(plan, DependencyExecutionOptions{ParentContext: parentCtx, Recovery: dt.onRecovery}); err != nil {
 		dt.recordError(err)
 		return err
 	}
