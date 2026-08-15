@@ -2,21 +2,29 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"ddsh/harness"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// plugin is a realistic application component. The processor plugin can own
+// a PostgreSQL connection pool while still using the same Component contract
+// as an in-memory plugin.
 type plugin struct {
 	name         string
 	requirements []string
+	databaseURL  string
 
 	mu           sync.Mutex
 	state        []byte
+	pool         *pgxpool.Pool
 	wakeCount    int32
 	sleepCount   int32
 	restoreCount int32
@@ -27,6 +35,12 @@ func newPlugin(name string, requirements ...string) *plugin {
 		name:         name,
 		requirements: append([]string(nil), requirements...),
 	}
+}
+
+func newPostgresPlugin(name, databaseURL string, requirements ...string) *plugin {
+	p := newPlugin(name, requirements...)
+	p.databaseURL = databaseURL
+	return p
 }
 
 func (p *plugin) Name() string { return p.name }
@@ -44,8 +58,19 @@ func (p *plugin) OnWakeUp(ctx *harness.SpatioTemporalContext) {
 	ctx.RegisterEffect("release-"+p.name+"-worker", func() {
 		fmt.Printf("[EFFECT] %s -> release worker resources\n", p.name)
 	})
-	ctx.RegisterEffect("release-"+p.name+"-connection", func() {
-		fmt.Printf("[EFFECT] %s -> release connection\n", p.name)
+
+	if p.databaseURL == "" {
+		fmt.Printf("[POSTGRES] %s -> disabled (DDSH_POSTGRES_URL is not set)\n", p.name)
+		return
+	}
+
+	if err := p.openPostgres(); err != nil {
+		panic(fmt.Sprintf("plugin %q PostgreSQL startup failed: %v", p.name, err))
+	}
+
+	ctx.RegisterEffect("close-"+p.name+"-postgres", func() {
+		p.closePostgres()
+		fmt.Printf("[POSTGRES] %s -> connection pool closed by rollback\n", p.name)
 	})
 }
 
@@ -54,7 +79,64 @@ func (p *plugin) OnSleep() {
 	fmt.Printf("[PLUGIN] %s -> sleep\n", p.name)
 }
 
+func (p *plugin) openPostgres() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.pool != nil {
+		return nil
+	}
+
+	connectCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(connectCtx, p.databaseURL)
+	if err != nil {
+		return err
+	}
+	if err := pool.Ping(connectCtx); err != nil {
+		pool.Close()
+		return err
+	}
+
+	_, err = pool.Exec(connectCtx, `
+		CREATE TABLE IF NOT EXISTS ddsh_plugin_events (
+			id BIGSERIAL PRIMARY KEY,
+			plugin_name TEXT NOT NULL,
+			status TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`) 
+	if err != nil {
+		pool.Close()
+		return err
+	}
+
+	_, err = pool.Exec(connectCtx,
+		`INSERT INTO ddsh_plugin_events (plugin_name, status) VALUES ($1, $2)`,
+		p.name, "woke")
+	if err != nil {
+		pool.Close()
+		return err
+	}
+
+	p.pool = pool
+	fmt.Printf("[POSTGRES] %s -> connected and recorded wake event\n", p.name)
+	return nil
+}
+
+func (p *plugin) closePostgres() {
+	p.mu.Lock()
+	pool := p.pool
+	p.pool = nil
+	p.mu.Unlock()
+	if pool != nil {
+		pool.Close()
+	}
+}
+
 // RestoreState is the optional capability consumed by RecoverWithReplacement.
+// The checkpoint is application state, not harness internals: the replacement
+// receives a copy and decides how to apply it.
 func (p *plugin) RestoreState(payload harness.StatePayload) error {
 	if len(payload.Data) == 0 {
 		return errors.New("replacement received an empty checkpoint")
@@ -79,17 +161,55 @@ func (p *plugin) stateValue() string {
 	return string(p.state)
 }
 
+func (p *plugin) snapshotState() ([]byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state := struct {
+		Plugin string `json:"plugin"`
+		Status string `json:"status"`
+		DB     bool   `json:"postgres_connected"`
+	}{
+		Plugin: p.name,
+		Status: string(p.state),
+		DB:     p.pool != nil,
+	}
+	return json.Marshal(state)
+}
+
+func (p *plugin) databaseEventCount() (int64, error) {
+	p.mu.Lock()
+	pool := p.pool
+	p.mu.Unlock()
+	if pool == nil {
+		return 0, nil
+	}
+
+	queryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var count int64
+	err := pool.QueryRow(queryCtx,
+		`SELECT COUNT(*) FROM ddsh_plugin_events WHERE plugin_name = $1`,
+		p.name).Scan(&count)
+	return count, err
+}
+
 func main() {
 	root := context.Background()
 	tracker := harness.NewDependencyTracker(nil)
 
 	fmt.Println("=== ddsh plugin example ===")
 	fmt.Println("This example demonstrates registration, coeffects, DAG planning,\n" +
-		"spatiotemporal effects, snapshots, replacement and reconciliation.")
+		"spatiotemporal effects, PostgreSQL resource ownership, snapshots,\n" +
+		"replacement and reconciliation.")
+
+	// Set DDSH_POSTGRES_URL to enable the real PostgreSQL integration. Without
+	// it, the example remains fully runnable as an offline harness demo.
+	databaseURL := os.Getenv("DDSH_POSTGRES_URL")
 
 	// 1. Create plugins and declare their coeffects.
 	storage := newPlugin("storage")
-	processor := newPlugin("processor", "storage")
+	processor := newPostgresPlugin("processor", databaseURL, "storage")
 	reporter := newPlugin("reporter", "storage", "metrics")
 
 	fmt.Println("\n--- 1. Register plugins and declare coeffects ---")
@@ -121,11 +241,18 @@ func main() {
 	}))
 	printGraph(tracker.Graph())
 
-	// Wake it again through the high-level transition API.
-	fmt.Println("\n--- 4. Wake the plugin through the transition API ---")
+	// Wake it again through the high-level transition API. This is where a
+	// real plugin would establish resources such as a database pool.
+	fmt.Println("\n--- 4. Wake the PostgreSQL-backed plugin ---")
 	must(tracker.Graph().TransitionWake("processor", harness.DependencyExecutionOptions{
 		ParentContext: root,
 	}))
+
+	if databaseURL != "" {
+		count, err := processor.databaseEventCount()
+		must(err)
+		fmt.Printf("[POSTGRES] processor -> persisted event count=%d\n", count)
+	}
 
 	// 5. Capture a known-good state.
 	fmt.Println("\n--- 5. Create a last-known-good state checkpoint ---")
@@ -135,15 +262,7 @@ func main() {
 	}
 
 	processor.setState("job=42;offset=137;status=running")
-	checkpoint, err := harness.MarshalJSONState(struct {
-		JobID  string `json:"job_id"`
-		Offset int    `json:"offset"`
-		Status string `json:"status"`
-	}{
-		JobID:  "job-42",
-		Offset: 137,
-		Status: "running",
-	})
+	checkpoint, err := processor.snapshotState()
 	must(err)
 	processorCtx.UpdateStateSnapshot(checkpoint)
 
@@ -153,12 +272,12 @@ func main() {
 		payload.Version, payload.Captured.Format(time.RFC3339), len(payload.Data))
 
 	// 6. Simulate a failure boundary. We explicitly roll back the failed
-	// runtime so the example is deterministic; the saved checkpoint survives
-	// rollback and is then consumed by RecoverWithReplacement.
+	// runtime so the example is deterministic. The PostgreSQL pool is one of
+	// the reversible resources owned by the context and is closed here.
 	fmt.Println("\n--- 6. Fail the plugin and replace it without changing DAG identity ---")
 	processorCtx.Rollback()
 
-	replacement := newPlugin("processor", "storage")
+	replacement := newPostgresPlugin("processor", databaseURL, "storage")
 	must(tracker.RecoverWithReplacement(root, "processor", replacement))
 
 	if replacement.stateValue() == "" {
@@ -168,6 +287,11 @@ func main() {
 		replacement.stateValue(),
 		atomic.LoadInt32(&replacement.wakeCount),
 		atomic.LoadInt32(&replacement.restoreCount))
+	if databaseURL != "" {
+		count, err := replacement.databaseEventCount()
+		must(err)
+		fmt.Printf("[POSTGRES] replacement -> persisted event count=%d\n", count)
+	}
 	printGraph(tracker.Graph())
 
 	// 7. Demonstrate hierarchical rollback independently of the DAG tracker.
