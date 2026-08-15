@@ -7,7 +7,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 type trackerTestComponent struct {
@@ -17,6 +16,7 @@ type trackerTestComponent struct {
 	mu        sync.Mutex
 	history   []string
 	wakeOrder *[]string
+	sleepOrder *[]string
 	wake      int32
 	sleep     int32
 	tracker   *DependencyTracker
@@ -45,6 +45,9 @@ func (c *trackerTestComponent) OnSleep() {
 	atomic.AddInt32(&c.sleep, 1)
 	c.mu.Lock()
 	c.history = append(c.history, "sleep")
+	if c.sleepOrder != nil {
+		*c.sleepOrder = append(*c.sleepOrder, c.name)
+	}
 	c.mu.Unlock()
 	if c.tracker != nil {
 		_ = c.tracker.Graph().DependentsOf(c.name)
@@ -68,12 +71,19 @@ func TestDependencyTrackerChainActivationAndDeactivation(t *testing.T) {
 		t.Fatalf("wake counts: %d %d %d", a.wake, b.wake, c.wake)
 	}
 
+	sleepOrder := make([]string, 0, 3)
+	a.sleepOrder = &sleepOrder
+	b.sleepOrder = &sleepOrder
+	c.sleepOrder = &sleepOrder
 	dt.DeactivateService("A")
 	if dt.Graph().Node("A").Active || dt.Graph().Node("B").Active || dt.Graph().Node("C").Active {
 		t.Fatal("chain remained active")
 	}
 	if a.sleep != 1 || b.sleep != 1 || c.sleep != 1 {
 		t.Fatalf("sleep counts: %d %d %d", a.sleep, b.sleep, c.sleep)
+	}
+	if got := fmt.Sprint(sleepOrder); got != "[C B A]" {
+		t.Fatalf("sleep order=%s", got)
 	}
 }
 
@@ -93,9 +103,17 @@ func TestDependencyTrackerDiamondTopologicalOrder(t *testing.T) {
 		t.Fatalf("registration wake order=%v", order)
 	}
 	dt.ActivateService(context.Background(), "A")
+	sleepOrder := make([]string, 0, 4)
+	a.sleepOrder = &sleepOrder
+	b.sleepOrder = &sleepOrder
+	c.sleepOrder = &sleepOrder
+	d.sleepOrder = &sleepOrder
 	dt.DeactivateService("A")
 	if d.sleep != 1 || b.sleep != 1 || c.sleep != 1 || a.sleep != 1 {
 		t.Fatal("diamond sleep counts incorrect")
+	}
+	if got := fmt.Sprint(sleepOrder); got != "[D B C A]" {
+		t.Fatalf("diamond sleep order=%s", got)
 	}
 }
 
@@ -134,9 +152,8 @@ func TestDependencyTrackerCycleRejectionIsAtomic(t *testing.T) {
 	if err := dt.RegisterComponentErr(context.Background(), a); !errors.Is(err, ErrDependencyCycle) {
 		t.Fatalf("err=%v", err)
 	}
-	info, ok := dt.Graph().Node("A")
-	if !ok || info.Component != nil {
-		t.Fatal("failed registration partially installed component A")
+	if _, ok := dt.Graph().Node("A"); ok {
+		t.Fatal("failed cycle registration partially installed provider A")
 	}
 	if dt.Graph().EdgeCount() != before {
 		t.Fatalf("edge count changed: %d -> %d", before, dt.Graph().EdgeCount())
@@ -179,27 +196,29 @@ func TestDependencyTrackerStalePlanIsReconciled(t *testing.T) {
 	d := newTrackerTestComponent("D", "A")
 	dt.RegisterComponent(context.Background(), d)
 
-	dt.mu.Lock()
-	dt.generation++
-	staleGeneration := dt.generation
-	dt.mu.Unlock()
-	plan, err := dt.graph.buildServiceTransition("A", true, staleGeneration)
+	plan, err := dt.graph.buildServiceTransition("A", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(plan.steps) != 1 {
 		t.Fatalf("steps=%d", len(plan.steps))
 	}
+	wakeGeneration := plan.generation
 
-	dt.mu.Lock()
-	dt.generation++
-	dt.mu.Unlock()
+	newerPlan, err := dt.graph.buildServiceTransition("A", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newerPlan.generation <= wakeGeneration {
+		t.Fatalf("generation did not advance: wake=%d sleep=%d", wakeGeneration, newerPlan.generation)
+	}
+
 	dt.executeDependencyPlan(context.Background(), plan)
 	if d.wake != 0 {
 		t.Fatalf("stale wake executed: %d", d.wake)
 	}
-	if dt.Graph().Node("D").Active != true {
-		t.Fatal("graph did not reserve the newer transition state")
+	if dt.Graph().Node("D").Active {
+		t.Fatal("stale wake changed graph state")
 	}
 }
 
