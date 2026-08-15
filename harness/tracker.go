@@ -25,15 +25,12 @@ func NewDependencyTracker(recovery RecoveryStrategy) *DependencyTracker {
 	return &DependencyTracker{graph: NewDependencyGraph(), onRecovery: recovery}
 }
 
-func (dt *DependencyTracker) Graph() *DependencyGraph {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
-	return dt.graph
-}
+// Graph returns the tracker's single authoritative dependency graph. The graph
+// pointer is immutable after tracker construction, so no tracker lock is
+// required to return it.
+func (dt *DependencyTracker) Graph() *DependencyGraph { return dt.graph }
 
 func (dt *DependencyTracker) GetActiveContext(name string) *SpatioTemporalContext {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
 	if node, ok := dt.graph.Node(name); ok && node.Active {
 		return node.Context
 	}
@@ -114,10 +111,10 @@ func (dt *DependencyTracker) clearError() {
 }
 
 func (dt *DependencyTracker) LastErrorIfCurrent(generation uint64) error {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
 	if dt.graph.Generation() != generation {
 		return nil
 	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
 	return dt.lastErr
 }
