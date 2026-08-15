@@ -11,9 +11,6 @@ import (
 	"ddsh/harness"
 )
 
-// plugin is a deliberately small application component. It demonstrates the
-// Component interface and also implements StateRestorer so the same logical
-// plugin can be replaced without losing its last-known-good state.
 type plugin struct {
 	name         string
 	requirements []string
