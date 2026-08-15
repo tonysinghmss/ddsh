@@ -14,11 +14,10 @@ type Component interface {
 }
 
 type DependencyTracker struct {
-	mu           sync.Mutex
-	transitionMu sync.Mutex
-	graph        *DependencyGraph
-	onRecovery   RecoveryStrategy
-	lastErr      error
+	mu         sync.Mutex
+	graph      *DependencyGraph
+	onRecovery RecoveryStrategy
+	lastErr    error
 }
 
 func NewDependencyTracker(recovery RecoveryStrategy) *DependencyTracker {
@@ -43,24 +42,20 @@ func (dt *DependencyTracker) RegisterComponent(parentCtx context.Context, comp C
 	}
 }
 
+// RegisterComponentErr installs a component and asks the graph to perform its
+// complete wake transition. Tracker state is not held while component
+// callbacks execute.
 func (dt *DependencyTracker) RegisterComponentErr(parentCtx context.Context, comp Component) error {
 	if comp == nil {
 		return fmt.Errorf("component is nil")
 	}
-	dt.transitionMu.Lock()
-	defer dt.transitionMu.Unlock()
 	dt.clearError()
 
 	if err := dt.graph.registerComponentAtomic(comp.Name(), comp, append([]string(nil), comp.Inject()...)); err != nil {
 		dt.recordError(err)
 		return err
 	}
-	plan, err := dt.graph.PlanWake(comp.Name())
-	if err != nil {
-		dt.recordError(err)
-		return err
-	}
-	if err := dt.graph.ExecuteWithOptions(plan, DependencyExecutionOptions{ParentContext: parentCtx, Recovery: dt.onRecovery}); err != nil {
+	if err := dt.graph.TransitionWake(comp.Name(), DependencyExecutionOptions{ParentContext: parentCtx, Recovery: dt.onRecovery}); err != nil {
 		dt.recordError(err)
 		return err
 	}
@@ -75,17 +70,9 @@ func (dt *DependencyTracker) ActivateService(parentCtx context.Context, serviceN
 }
 
 func (dt *DependencyTracker) ActivateServiceErr(parentCtx context.Context, serviceName string) error {
-	dt.transitionMu.Lock()
-	defer dt.transitionMu.Unlock()
 	dt.clearError()
-
 	fmt.Printf("\n📡 [Dependency Engine]: Service Registry altered -> '%s' is now ONLINE\n", serviceName)
-	plan, err := dt.graph.PlanWake(serviceName)
-	if err != nil {
-		dt.recordError(err)
-		return err
-	}
-	if err := dt.graph.ExecuteWithOptions(plan, DependencyExecutionOptions{ParentContext: parentCtx, Recovery: dt.onRecovery}); err != nil {
+	if err := dt.graph.TransitionWake(serviceName, DependencyExecutionOptions{ParentContext: parentCtx, Recovery: dt.onRecovery}); err != nil {
 		dt.recordError(err)
 		return err
 	}
@@ -100,17 +87,9 @@ func (dt *DependencyTracker) DeactivateService(serviceName string) {
 }
 
 func (dt *DependencyTracker) DeactivateServiceErr(serviceName string) error {
-	dt.transitionMu.Lock()
-	defer dt.transitionMu.Unlock()
 	dt.clearError()
-
 	fmt.Printf("\n🛑 [Dependency Engine]: Service Registry altered -> '%s' went OFFLINE\n", serviceName)
-	plan, err := dt.graph.PlanSleep(serviceName)
-	if err != nil {
-		dt.recordError(err)
-		return err
-	}
-	if err := dt.graph.ExecuteWithOptions(plan, DependencyExecutionOptions{ParentContext: context.Background(), Recovery: dt.onRecovery}); err != nil {
+	if err := dt.graph.TransitionSleep(serviceName, DependencyExecutionOptions{ParentContext: context.Background(), Recovery: dt.onRecovery}); err != nil {
 		dt.recordError(err)
 		return err
 	}
