@@ -13,13 +13,13 @@ type trackerTestComponent struct {
 	name string
 	reqs []string
 
-	mu          sync.Mutex
-	history     []string
-	wakeOrder   *[]string
-	sleepOrder  *[]string
-	wake        int32
-	sleep       int32
-	tracker     *DependencyTracker
+	mu         sync.Mutex
+	history    []string
+	wakeOrder  *[]string
+	sleepOrder *[]string
+	wake       int32
+	sleep      int32
+	tracker    *DependencyTracker
 }
 
 func newTrackerTestComponent(name string, reqs ...string) *trackerTestComponent {
@@ -98,7 +98,6 @@ func TestDependencyTrackerDiamondTopologicalOrder(t *testing.T) {
 		component.wakeOrder = &order
 		dt.RegisterComponent(context.Background(), component)
 	}
-
 	if fmt.Sprint(order) != "[A B C D]" {
 		t.Fatalf("registration wake order=%v", order)
 	}
@@ -121,7 +120,6 @@ func TestDependencyTrackerMultiParentAndSharedDependent(t *testing.T) {
 	dt := NewDependencyTracker(nil)
 	d := newTrackerTestComponent("D", "A", "B")
 	dt.RegisterComponent(context.Background(), d)
-
 	dt.ActivateService(context.Background(), "A")
 	if dt.Graph().Node("D").Active {
 		t.Fatal("D woke with only A active")
@@ -130,7 +128,6 @@ func TestDependencyTrackerMultiParentAndSharedDependent(t *testing.T) {
 	if !dt.Graph().Node("D").Active || d.wake != 1 {
 		t.Fatal("D did not wake exactly once")
 	}
-
 	dt.DeactivateService("A")
 	if !dt.Graph().Node("D").Active || d.sleep != 0 {
 		t.Fatal("D slept while B remained active")
@@ -174,7 +171,6 @@ func TestDependencyTrackerConcurrentActivationDeactivation(t *testing.T) {
 	dt := NewDependencyTracker(nil)
 	b := newTrackerTestComponent("B", "A")
 	dt.RegisterComponent(context.Background(), b)
-
 	const rounds = 50
 	var wg sync.WaitGroup
 	for i := 0; i < rounds; i++ {
@@ -191,34 +187,38 @@ func TestDependencyTrackerConcurrentActivationDeactivation(t *testing.T) {
 	}
 }
 
-func TestDependencyTrackerStalePlanIsReconciled(t *testing.T) {
+func TestDependencyTrackerStalePlanIsRejectedByPublicExecutor(t *testing.T) {
 	dt := NewDependencyTracker(nil)
 	d := newTrackerTestComponent("D", "A")
 	dt.RegisterComponent(context.Background(), d)
 
-	plan, err := dt.graph.buildServiceTransition("A", true)
+	wakePlan, err := dt.Graph().PlanWake("A")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.steps) != 1 {
-		t.Fatalf("steps=%d", len(plan.steps))
+	if len(wakePlan.Actions) != 2 {
+		t.Fatalf("wake actions=%d", len(wakePlan.Actions))
 	}
-	wakeGeneration := plan.generation
+	if d.wake != 1 {
+		t.Fatalf("registration unexpectedly did not activate D: wake=%d", d.wake)
+	}
 
-	newerPlan, err := dt.graph.buildServiceTransition("A", false)
+	// PlanSleep is the newer transition. Its generation supersedes the wake
+	// plan before the stale wake plan is handed to the executor.
+	sleepPlan, err := dt.Graph().PlanSleep("A")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if newerPlan.generation <= wakeGeneration {
-		t.Fatalf("generation did not advance: wake=%d sleep=%d", wakeGeneration, newerPlan.generation)
+	if sleepPlan.Generation <= wakePlan.Generation {
+		t.Fatalf("generation did not advance: wake=%d sleep=%d", wakePlan.Generation, sleepPlan.Generation)
 	}
 
-	dt.executeDependencyPlan(context.Background(), plan)
-	if d.wake != 0 {
-		t.Fatalf("stale wake executed: %d", d.wake)
+	beforeWake := d.wake
+	if err := dt.Graph().ExecuteWithOptions(wakePlan, DependencyExecutionOptions{}); !errors.Is(err, ErrDependencyPlanStale) {
+		t.Fatalf("err=%v", err)
 	}
-	if dt.Graph().Node("D").Active {
-		t.Fatal("stale wake changed graph state")
+	if d.wake != beforeWake {
+		t.Fatalf("stale wake executed: before=%d after=%d", beforeWake, d.wake)
 	}
 }
 
