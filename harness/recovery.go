@@ -75,6 +75,17 @@ func (dt *DependencyTracker) RecoverWithReplacement(parentCtx context.Context, f
 	dt.graph.planMu.Lock()
 	defer dt.graph.planMu.Unlock()
 
+	// Re-read the logical node while planMu is held. A concurrent recovery may
+	// have replaced it since the initial snapshot lookup; never overwrite a
+	// newer runtime with a stale recovery attempt.
+	current, ok := dt.graph.Node(failedName)
+	if !ok || current.Component != node.Component || current.Context != failedCtx {
+		replacementCtx.Rollback()
+		err := fmt.Errorf("%w: runtime for %q changed during recovery", ErrDependencyPlanStale, failedName)
+		dt.recordError(err)
+		return err
+	}
+
 	plan, err := dt.graph.replaceNodeRuntimeUnlocked(failedName, replacement, replacementCtx)
 	if err != nil {
 		replacementCtx.Rollback()
