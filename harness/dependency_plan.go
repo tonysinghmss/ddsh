@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -18,8 +19,6 @@ var (
 	ErrDependencyPlanInvalid = errors.New("invalid dependency plan")
 )
 
-// DependencyAction is a detached lifecycle instruction. The graph never
-// invokes Component or Context methods while its graph mutex is held.
 type DependencyAction struct {
 	NodeName  string
 	Action    DependencyActionType
@@ -27,11 +26,14 @@ type DependencyAction struct {
 	Context   *SpatioTemporalContext
 }
 
-// DependencyPlan owns its Actions backing slice and records the graph
-// generation whose state it represents.
 type DependencyPlan struct {
 	Generation uint64
 	Actions    []DependencyAction
+}
+
+type DependencyExecutionOptions struct {
+	ParentContext context.Context
+	Recovery      RecoveryStrategy
 }
 
 func (g *DependencyGraph) PlanWake(name string) (DependencyPlan, error) {
@@ -52,9 +54,8 @@ func (g *DependencyGraph) PlanWake(name string) (DependencyPlan, error) {
 	return DependencyPlan{Generation: g.generation, Actions: actions}, nil
 }
 
-// PlanSleep transitions the named root inactive and returns only the
-// downstream invalidation actions. The root's own lifecycle callback is not
-// part of the cascade plan.
+// PlanSleep includes the requested root's own sleep action followed by every
+// downstream node invalidated by the transition, in reverse dependency order.
 func (g *DependencyGraph) PlanSleep(name string) (DependencyPlan, error) {
 	g.planMu.Lock()
 	defer g.planMu.Unlock()
@@ -73,32 +74,40 @@ func (g *DependencyGraph) PlanSleep(name string) (DependencyPlan, error) {
 	return DependencyPlan{Generation: g.generation, Actions: actions}, nil
 }
 
-// Execute validates generation and each action at an execution boundary, then
-// releases all graph synchronization before calling application code. A
-// concurrent graph transition is therefore detected before the next action.
 func (g *DependencyGraph) Execute(plan DependencyPlan) error {
+	return g.ExecuteWithOptions(plan, DependencyExecutionOptions{})
+}
+
+// ExecuteWithOptions is the one lifecycle execution path for both wake and
+// sleep plans. The graph mutex is never held while application callbacks,
+// context creation, or rollback execute.
+func (g *DependencyGraph) ExecuteWithOptions(plan DependencyPlan, options DependencyExecutionOptions) error {
+	if options.ParentContext == nil {
+		options.ParentContext = context.Background()
+	}
+	if err := validateDependencyPlan(plan); err != nil {
+		return err
+	}
+
+	// planMu serializes graph transitions with plan execution. g.mu remains
+	// available while callbacks execute, so callbacks can safely inspect graph
+	// state without lock inversion.
+	g.planMu.Lock()
+	defer g.planMu.Unlock()
+
 	for _, action := range plan.Actions {
-		g.planMu.Lock()
 		g.mu.RLock()
 		generation := g.generation
-		valid := generation == plan.Generation
-		if valid {
-			valid = g.actionMatchesNodeLocked(action)
-		}
+		valid := generation == plan.Generation && g.actionMatchesNodeLocked(action)
 		g.mu.RUnlock()
-		g.planMu.Unlock()
-
 		if !valid {
 			return fmt.Errorf("%w: plan generation=%d graph generation=%d", ErrDependencyPlanStale, plan.Generation, generation)
-		}
-		if action.Action != DependencyActionWake && action.Action != DependencyActionSleep {
-			return fmt.Errorf("%w: unknown action type %d", ErrDependencyPlanInvalid, action.Action)
 		}
 
 		switch action.Action {
 		case DependencyActionWake:
-			if action.Component != nil {
-				action.Component.OnWakeUp(action.Context)
+			if err := g.executeWakeAction(options, action); err != nil {
+				return err
 			}
 		case DependencyActionSleep:
 			if action.Component != nil {
@@ -107,9 +116,56 @@ func (g *DependencyGraph) Execute(plan DependencyPlan) error {
 			if action.Context != nil {
 				action.Context.Rollback()
 			}
+			g.clearExecutedContext(action)
 		}
 	}
 	return nil
+}
+
+func validateDependencyPlan(plan DependencyPlan) error {
+	seen := make(map[string]struct{}, len(plan.Actions))
+	for _, action := range plan.Actions {
+		if action.NodeName == "" || action.Component == nil {
+			return fmt.Errorf("%w: action for %q has missing node/component", ErrDependencyPlanInvalid, action.NodeName)
+		}
+		if action.Action != DependencyActionWake && action.Action != DependencyActionSleep {
+			return fmt.Errorf("%w: unknown action type %d", ErrDependencyPlanInvalid, action.Action)
+		}
+		if _, exists := seen[action.NodeName]; exists {
+			return fmt.Errorf("%w: duplicate action for %q", ErrDependencyPlanInvalid, action.NodeName)
+		}
+		seen[action.NodeName] = struct{}{}
+	}
+	return nil
+}
+
+func (g *DependencyGraph) executeWakeAction(options DependencyExecutionOptions, action DependencyAction) error {
+	ctx := action.Context
+	if ctx == nil {
+		ctx = NewSTContext(options.ParentContext, action.NodeName, options.Recovery)
+		g.mu.Lock()
+		node, ok := g.nodes[action.NodeName]
+		if !ok || !node.active || node.component != action.Component || node.context != nil {
+			g.mu.Unlock()
+			return fmt.Errorf("%w: wake context materialization changed node %q", ErrDependencyPlanStale, action.NodeName)
+		}
+		node.context = ctx
+		g.mu.Unlock()
+	}
+	action.Component.OnWakeUp(ctx)
+	return nil
+}
+
+func (g *DependencyGraph) clearExecutedContext(action DependencyAction) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	node, ok := g.nodes[action.NodeName]
+	if !ok {
+		return
+	}
+	if node.context == action.Context {
+		node.context = nil
+	}
 }
 
 func (g *DependencyGraph) Generation() uint64 {
@@ -119,24 +175,23 @@ func (g *DependencyGraph) Generation() uint64 {
 }
 
 func (g *DependencyGraph) actionMatchesNodeLocked(action DependencyAction) bool {
-	if action.NodeName == "" {
+	if action.NodeName == "" || (action.Action != DependencyActionWake && action.Action != DependencyActionSleep) {
 		return false
 	}
 	node, ok := g.nodes[action.NodeName]
-	if !ok {
+	if !ok || node.component != action.Component {
 		return false
 	}
-	if action.Action != DependencyActionWake && action.Action != DependencyActionSleep {
-		return false
+	if action.Action == DependencyActionWake {
+		return node.active && (action.Context == nil || node.context == action.Context)
 	}
-	return node.component == action.Component && node.context == action.Context
+	return !node.active && node.context == action.Context
 }
 
 func (g *DependencyGraph) planWakeLocked(name string) ([]DependencyAction, bool, error) {
 	if g.nodes[name].active {
 		return nil, false, nil
 	}
-
 	candidate := make(map[string]struct{})
 	queue := []string{name}
 	candidate[name] = struct{}{}
@@ -152,9 +207,6 @@ func (g *DependencyGraph) planWakeLocked(name string) ([]DependencyAction, bool,
 		}
 	}
 
-	// Kahn indegree counts every currently-inactive provider, including
-	// providers outside candidate. Active providers contribute zero. Thus a
-	// blocked parent prevents all descendants from being woken.
 	indegree := make(map[string]int, len(candidate))
 	for nodeName := range candidate {
 		for provider := range g.nodes[nodeName].providers {
@@ -180,10 +232,7 @@ func (g *DependencyGraph) planWakeLocked(name string) ([]DependencyAction, bool,
 		if !node.active {
 			node.active = true
 			changed = true
-			actions = append(actions, DependencyAction{
-				NodeName: current, Action: DependencyActionWake,
-				Component: node.component, Context: node.context,
-			})
+			actions = append(actions, DependencyAction{NodeName: current, Action: DependencyActionWake, Component: node.component, Context: node.context})
 		}
 		for _, dependent := range sortedDependencyNames(node.dependents) {
 			if _, included := candidate[dependent]; !included {
@@ -205,7 +254,6 @@ func (g *DependencyGraph) planSleepLocked(name string) ([]DependencyAction, bool
 	if !g.nodes[name].active {
 		return nil, false, nil
 	}
-
 	candidate := make(map[string]struct{})
 	queue := []string{name}
 	candidate[name] = struct{}{}
@@ -263,13 +311,7 @@ func (g *DependencyGraph) planSleepLocked(name string) ([]DependencyAction, bool
 			continue
 		}
 		node.active = false
-		if nodeName == name {
-			continue
-		}
-		actions = append(actions, DependencyAction{
-			NodeName: node.name, Action: DependencyActionSleep,
-			Component: node.component, Context: node.context,
-		})
+		actions = append(actions, DependencyAction{NodeName: node.name, Action: DependencyActionSleep, Component: node.component, Context: node.context})
 	}
 	return actions, true, nil
 }
