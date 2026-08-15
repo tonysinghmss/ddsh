@@ -180,6 +180,9 @@ func main() {
 	childScope.RegisterEffect("plugin-cleanup", func() {
 		fmt.Println("[EFFECT] plugin-scope -> final cleanup")
 	})
+	if childScope.ParentST() != rootScope {
+		panic("plugin scope lost its structural parent")
+	}
 	rootScope.Rollback()
 
 	fmt.Println("\n=== Example completed successfully ===")
