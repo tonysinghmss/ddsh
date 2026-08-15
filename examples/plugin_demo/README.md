@@ -51,7 +51,7 @@ storage
    └──────────────► reporter ◄──────── metrics
 ```
 
-`storage` has no requirements and can wake immediately. `processor` requires `storage`. `reporter` declares `storage` and `metrics`; under the current ddsh OR-style multi-provider eligibility rule, it becomes eligible when at least one required provider remains active. The example activates `metrics` after registration so the reactive transition is visible.
+`storage` has no requirements and can wake immediately. `processor` requires `storage`. `reporter` declares `storage` and `metrics`, so it initially waits until both providers are active. Once a multi-parent dependent is already active, the current sleep/reconciliation logic keeps it eligible as long as at least one provider remains active. This distinction is important: the current implementation uses all-provider readiness for initial activation and remaining-provider eligibility during downstream reconciliation.
 
 ## Why effects belong to the context
 
