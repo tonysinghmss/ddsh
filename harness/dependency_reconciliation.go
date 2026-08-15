@@ -6,72 +6,41 @@ import (
 	"sort"
 )
 
-// registerComponentAtomic adds a component and all previously unknown provider
-// nodes as one graph transaction. No graph mutation occurs when any new edge
-// would introduce a cycle.
 func (g *DependencyGraph) registerComponentAtomic(name string, component Component, requirements []string) error {
-	if err := validateDependencyNodeName(name); err != nil {
-		return err
-	}
+	if err := validateDependencyNodeName(name); err != nil { return err }
 	for _, provider := range requirements {
-		if err := validateDependencyNodeName(provider); err != nil {
-			return fmt.Errorf("provider: %w", err)
-		}
+		if err := validateDependencyNodeName(provider); err != nil { return fmt.Errorf("provider: %w", err) }
 	}
-
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	existing, exists := g.nodes[name]
-	if exists && existing.component != nil {
-		return fmt.Errorf("%w: %q", ErrDependencyNodeExists, name)
-	}
+	if exists && existing.component != nil { return fmt.Errorf("%w: %q", ErrDependencyNodeExists, name) }
 
 	adj := make(map[string]map[string]struct{}, len(g.nodes)+len(requirements))
 	for nodeName, node := range g.nodes {
 		adj[nodeName] = make(map[string]struct{}, len(node.dependents))
-		for dependent := range node.dependents {
-			adj[nodeName][dependent] = struct{}{}
-		}
+		for dependent := range node.dependents { adj[nodeName][dependent] = struct{}{} }
 	}
-	if _, ok := adj[name]; !ok {
-		adj[name] = make(map[string]struct{})
-	}
+	if _, ok := adj[name]; !ok { adj[name] = make(map[string]struct{}) }
 	for _, provider := range requirements {
-		if _, ok := adj[provider]; !ok {
-			adj[provider] = make(map[string]struct{})
-		}
+		if _, ok := adj[provider]; !ok { adj[provider] = make(map[string]struct{}) }
 		adj[provider][name] = struct{}{}
 	}
-	if cycle := findCycleInAdjacency(adj); len(cycle) != 0 {
-		return fmt.Errorf("%w: %s", ErrDependencyCycle, joinPath(cycle))
-	}
+	if cycle := findCycleInAdjacency(adj); len(cycle) != 0 { return fmt.Errorf("%w: %s", ErrDependencyCycle, joinPath(cycle)) }
 
 	if !exists {
-		g.nodes[name] = &dependencyNode{
-			name: name,
-			component: component,
-			providers: make(map[string]*dependencyEdge),
-			dependents: make(map[string]*dependencyEdge),
-		}
+		g.nodes[name] = &dependencyNode{name: name, component: component, providers: make(map[string]*dependencyEdge), dependents: make(map[string]*dependencyEdge)}
 	} else {
 		existing.component = component
 	}
 	for provider := range adj {
-		if _, exists := g.nodes[provider]; exists {
-			continue
-		}
-		g.nodes[provider] = &dependencyNode{
-			name: provider,
-			providers: make(map[string]*dependencyEdge),
-			dependents: make(map[string]*dependencyEdge),
-		}
+		if _, exists := g.nodes[provider]; exists { continue }
+		g.nodes[provider] = &dependencyNode{name: provider, providers: make(map[string]*dependencyEdge), dependents: make(map[string]*dependencyEdge)}
 	}
 	for _, provider := range requirements {
 		key := dependencyEdgeKey{provider: provider, dependent: name}
-		if _, exists := g.edges[key]; exists {
-			continue
-		}
+		if _, exists := g.edges[key]; exists { continue }
 		edge := &dependencyEdge{provider: provider, dependent: name}
 		g.edges[key] = edge
 		g.nodes[provider].dependents[name] = edge
@@ -81,74 +50,52 @@ func (g *DependencyGraph) registerComponentAtomic(name string, component Compone
 }
 
 func (g *DependencyGraph) ensureProviderLocked(name string) error {
-	if err := validateDependencyNodeName(name); err != nil {
-		return err
-	}
-	if _, ok := g.nodes[name]; ok {
-		return nil
-	}
+	if err := validateDependencyNodeName(name); err != nil { return err }
+	if _, ok := g.nodes[name]; ok { return nil }
 	g.nodes[name] = &dependencyNode{name: name, providers: make(map[string]*dependencyEdge), dependents: make(map[string]*dependencyEdge)}
 	return nil
 }
 
-// buildServiceTransition atomically updates graph activity and returns an immutable plan.
-// The graph lock is released before the plan is executed.
 func (g *DependencyGraph) buildServiceTransition(serviceName string, active bool, generation uint64) (DependencyPlan, error) {
-	if err := validateDependencyNodeName(serviceName); err != nil {
-		return DependencyPlan{}, err
-	}
+	if err := validateDependencyNodeName(serviceName); err != nil { return DependencyPlan{}, err }
 	g.mu.Lock()
 	defer g.mu.Unlock()
-
-	if err := g.ensureProviderLocked(serviceName); err != nil {
-		return DependencyPlan{}, err
-	}
+	if err := g.ensureProviderLocked(serviceName); err != nil { return DependencyPlan{}, err }
 	trigger := g.nodes[serviceName]
-	if trigger.active == active {
-		return DependencyPlan{kind: executionKind(active), generation: generation}, nil
-	}
+	if trigger.active == active { return DependencyPlan{kind: executionKind(active), generation: generation}, nil }
 
 	order, err := g.topologicalOrderLocked()
-	if err != nil {
-		return DependencyPlan{}, err
-	}
+	if err != nil { return DependencyPlan{}, err }
 	steps := make([]ExecutionStep, 0)
 	if active {
 		trigger.active = true
 		for _, name := range order {
 			node := g.nodes[name]
-			if node.active || node.component == nil || !g.allProvidersActiveLocked(node) || !g.reachableFromLocked(serviceName, name) {
-				continue
-			}
+			if node.active || node.component == nil || !g.allProvidersActiveLocked(node) || !g.reachableFromLocked(serviceName, name) { continue }
 			node.active = true
 			steps = append(steps, ExecutionStep{Name: name, Component: node.component, Context: node.context})
 		}
 	} else {
+		triggerWasActive := trigger.active
 		trigger.active = false
 		candidates := make(map[string]struct{})
+		if triggerWasActive && trigger.component != nil { candidates[serviceName] = struct{}{} }
 		queue := []string{serviceName}
 		seen := map[string]bool{serviceName: true}
 		for len(queue) > 0 {
 			name := queue[0]
 			queue = queue[1:]
 			for dependent := range g.nodes[name].dependents {
-				if !seen[dependent] {
-					seen[dependent] = true
-					queue = append(queue, dependent)
-				}
+				if !seen[dependent] { seen[dependent] = true; queue = append(queue, dependent) }
 			}
 		}
 		for name := range seen {
 			node := g.nodes[name]
-			if node != nil && node.active && node.component != nil && !g.allProvidersActiveLocked(node) {
-				candidates[name] = struct{}{}
-			}
+			if node != nil && node.active && node.component != nil && !g.allProvidersActiveLocked(node) { candidates[name] = struct{}{} }
 		}
 		for i := len(order) - 1; i >= 0; i-- {
 			name := order[i]
-			if _, ok := candidates[name]; !ok {
-				continue
-			}
+			if _, ok := candidates[name]; !ok { continue }
 			node := g.nodes[name]
 			node.active = false
 			steps = append(steps, ExecutionStep{Name: name, Component: node.component, Context: node.context})
@@ -157,15 +104,10 @@ func (g *DependencyGraph) buildServiceTransition(serviceName string, active bool
 	return DependencyPlan{kind: executionKind(active), generation: generation, steps: steps}, nil
 }
 
-func executionKind(active bool) ExecutionKind {
-	if active { return ExecutionWake }
-	return ExecutionSleep
-}
+func executionKind(active bool) ExecutionKind { if active { return ExecutionWake }; return ExecutionSleep }
 
 func (g *DependencyGraph) allProvidersActiveLocked(node *dependencyNode) bool {
-	for provider := range node.providers {
-		if !g.nodes[provider].active { return false }
-	}
+	for provider := range node.providers { if !g.nodes[provider].active { return false } }
 	return true
 }
 
@@ -283,9 +225,7 @@ func (dt *DependencyTracker) reconcileNewRegistrationLocked(_ context.Context, n
 	dt.graph.mu.Lock()
 	defer dt.graph.mu.Unlock()
 	node := dt.graph.nodes[name]
-	if node == nil || node.active || node.component == nil || !dt.graph.allProvidersActiveLocked(node) {
-		return DependencyPlan{kind: ExecutionWake, generation: dt.generation}, nil
-	}
+	if node == nil || node.active || node.component == nil || !dt.graph.allProvidersActiveLocked(node) { return DependencyPlan{kind: ExecutionWake, generation: dt.generation}, nil }
 	node.active = true
 	return DependencyPlan{kind: ExecutionWake, generation: dt.generation, steps: []ExecutionStep{{Name: name, Component: node.component, Context: node.context}}}, nil
 }
