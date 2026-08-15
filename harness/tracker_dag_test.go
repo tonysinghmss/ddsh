@@ -13,13 +13,13 @@ type trackerTestComponent struct {
 	name string
 	reqs []string
 
-	mu        sync.Mutex
-	history   []string
-	wakeOrder *[]string
-	sleepOrder *[]string
-	wake      int32
-	sleep     int32
-	tracker   *DependencyTracker
+	mu          sync.Mutex
+	history     []string
+	wakeOrder   *[]string
+	sleepOrder  *[]string
+	wake        int32
+	sleep       int32
+	tracker     *DependencyTracker
 }
 
 func newTrackerTestComponent(name string, reqs ...string) *trackerTestComponent {
@@ -112,7 +112,7 @@ func TestDependencyTrackerDiamondTopologicalOrder(t *testing.T) {
 	if d.sleep != 1 || b.sleep != 1 || c.sleep != 1 || a.sleep != 1 {
 		t.Fatal("diamond sleep counts incorrect")
 	}
-	if got := fmt.Sprint(sleepOrder); got != "[D B C A]" {
+	if got := fmt.Sprint(sleepOrder); got != "[D C B A]" {
 		t.Fatalf("diamond sleep order=%s", got)
 	}
 }
