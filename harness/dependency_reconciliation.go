@@ -15,6 +15,8 @@ func (g *DependencyGraph) registerComponentAtomic(name string, component Compone
 			return fmt.Errorf("provider: %w", err)
 		}
 	}
+	g.planMu.Lock()
+	defer g.planMu.Unlock()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -64,32 +66,40 @@ func (g *DependencyGraph) registerComponentAtomic(name string, component Compone
 		g.nodes[provider].dependents[name] = edge
 		g.nodes[name].providers[provider] = edge
 	}
+	g.generation++
 	return nil
 }
 
-func (g *DependencyGraph) ensureProviderLocked(name string) error {
+func (g *DependencyGraph) ensureProviderLocked(name string) (bool, error) {
 	if err := validateDependencyNodeName(name); err != nil {
-		return err
+		return false, err
 	}
 	if _, ok := g.nodes[name]; ok {
-		return nil
+		return false, nil
 	}
 	g.nodes[name] = &dependencyNode{name: name, providers: make(map[string]*dependencyEdge), dependents: make(map[string]*dependencyEdge)}
-	return nil
+	return true, nil
 }
 
-func (g *DependencyGraph) buildServiceTransition(serviceName string, active bool, generation uint64) (DependencyPlan, error) {
+func (g *DependencyGraph) buildServiceTransition(serviceName string, active bool) (DependencyPlan, error) {
 	if err := validateDependencyNodeName(serviceName); err != nil {
 		return DependencyPlan{}, err
 	}
+	g.planMu.Lock()
+	defer g.planMu.Unlock()
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if err := g.ensureProviderLocked(serviceName); err != nil {
+
+	created, err := g.ensureProviderLocked(serviceName)
+	if err != nil {
 		return DependencyPlan{}, err
+	}
+	if created {
+		g.generation++
 	}
 	trigger := g.nodes[serviceName]
 	if trigger.active == active {
-		return DependencyPlan{kind: executionKind(active), generation: generation}, nil
+		return DependencyPlan{kind: executionKind(active), generation: g.generation}, nil
 	}
 
 	order, err := g.topologicalOrderLocked()
@@ -142,7 +152,8 @@ func (g *DependencyGraph) buildServiceTransition(serviceName string, active bool
 			steps = append(steps, ExecutionStep{Name: name, Component: node.component, Context: node.context})
 		}
 	}
-	return DependencyPlan{kind: executionKind(active), generation: generation, steps: steps}, nil
+	g.generation++
+	return DependencyPlan{kind: executionKind(active), generation: g.generation, steps: steps}, nil
 }
 
 func executionKind(active bool) ExecutionKind {
@@ -288,6 +299,13 @@ func (dt *DependencyTracker) executeDependencyPlan(parentCtx context.Context, pl
 		dt.recordError(err)
 		return
 	}
+
+	// planMu is the graph's transition/execution serialization boundary. It is
+	// deliberately held without g.mu, so callbacks can safely re-enter graph
+	// queries and context operations without lock inversion.
+	dt.graph.planMu.Lock()
+	defer dt.graph.planMu.Unlock()
+
 	for _, step := range plan.steps {
 		if !dt.planCurrent(plan.generation) {
 			return
@@ -331,7 +349,6 @@ func (dt *DependencyTracker) registerAndPlan(parentCtx context.Context, comp Com
 	if err := dt.graph.registerComponentAtomic(comp.Name(), comp, append([]string(nil), comp.Inject()...)); err != nil {
 		return DependencyPlan{}, err
 	}
-	dt.generation++
 	return dt.reconcileNewRegistrationLocked(parentCtx, comp.Name())
 }
 
@@ -340,16 +357,15 @@ func (dt *DependencyTracker) reconcileNewRegistrationLocked(_ context.Context, n
 	defer dt.graph.mu.Unlock()
 	node := dt.graph.nodes[name]
 	if node == nil || node.active || node.component == nil || !dt.graph.allProvidersActiveLocked(node) {
-		return DependencyPlan{kind: ExecutionWake, generation: dt.generation}, nil
+		return DependencyPlan{kind: ExecutionWake, generation: dt.graph.generation}, nil
 	}
 	node.active = true
-	return DependencyPlan{kind: ExecutionWake, generation: dt.generation, steps: []ExecutionStep{{Name: name, Component: node.component, Context: node.context}}}, nil
+	dt.graph.generation++
+	return DependencyPlan{kind: ExecutionWake, generation: dt.graph.generation, steps: []ExecutionStep{{Name: name, Component: node.component, Context: node.context}}}, nil
 }
 
 func (dt *DependencyTracker) planCurrent(generation uint64) bool {
-	dt.mu.Lock()
-	defer dt.mu.Unlock()
-	return dt.generation == generation
+	return dt.graph.Generation() == generation
 }
 
 func (dt *DependencyTracker) recordError(err error) {
