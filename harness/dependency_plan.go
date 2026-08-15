@@ -46,13 +46,18 @@ func (g *DependencyGraph) PlanWake(name string) (DependencyPlan, error) {
 		return DependencyPlan{}, fmt.Errorf("%w: %q", ErrDependencyNodeNotFound, name)
 	}
 	actions, changed, err := g.planWakeLocked(name)
-	if err != nil { return DependencyPlan{}, err }
-	if changed { g.generation++ }
+	if err != nil {
+		return DependencyPlan{}, err
+	}
+	if changed {
+		g.generation++
+	}
 	return DependencyPlan{Generation: g.generation, Actions: actions}, nil
 }
 
-// PlanSleep atomically calculates a downstream invalidation and commits the
-// resulting activation metadata before returning the immutable plan.
+// PlanSleep atomically calculates downstream invalidation. The named root is
+// transitioned inactive in graph state, but its own sleep callback is not part
+// of the cascade plan: callers requested a downstream invalidation plan.
 func (g *DependencyGraph) PlanSleep(name string) (DependencyPlan, error) {
 	g.planMu.Lock()
 	defer g.planMu.Unlock()
@@ -62,8 +67,12 @@ func (g *DependencyGraph) PlanSleep(name string) (DependencyPlan, error) {
 		return DependencyPlan{}, fmt.Errorf("%w: %q", ErrDependencyNodeNotFound, name)
 	}
 	actions, changed, err := g.planSleepLocked(name)
-	if err != nil { return DependencyPlan{}, err }
-	if changed { g.generation++ }
+	if err != nil {
+		return DependencyPlan{}, err
+	}
+	if changed {
+		g.generation++
+	}
 	return DependencyPlan{Generation: g.generation, Actions: actions}, nil
 }
 
@@ -79,15 +88,23 @@ func (g *DependencyGraph) Execute(plan DependencyPlan) error {
 	if plan.Generation != generation {
 		return fmt.Errorf("%w: plan generation=%d graph generation=%d", ErrDependencyPlanStale, plan.Generation, generation)
 	}
-	if err := g.validatePlanNodes(plan); err != nil { return err }
+	if err := g.validatePlanNodes(plan); err != nil {
+		return err
+	}
 
 	for _, action := range plan.Actions {
 		switch action.Action {
 		case DependencyActionWake:
-			if action.Component != nil { action.Component.OnWakeUp(action.Context) }
+			if action.Component != nil {
+				action.Component.OnWakeUp(action.Context)
+			}
 		case DependencyActionSleep:
-			if action.Component != nil { action.Component.OnSleep() }
-			if action.Context != nil { action.Context.Rollback() }
+			if action.Component != nil {
+				action.Component.OnSleep()
+			}
+			if action.Context != nil {
+				action.Context.Rollback()
+			}
 		default:
 			return fmt.Errorf("%w: unknown action type %d", ErrDependencyPlanInvalid, action.Action)
 		}
@@ -95,18 +112,26 @@ func (g *DependencyGraph) Execute(plan DependencyPlan) error {
 	return nil
 }
 
-func (g *DependencyGraph) Generation() uint64 { g.mu.RLock(); defer g.mu.RUnlock(); return g.generation }
+func (g *DependencyGraph) Generation() uint64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.generation
+}
 
 func (g *DependencyGraph) validatePlanNodes(plan DependencyPlan) error {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	for i, action := range plan.Actions {
-		if action.NodeName == "" { return fmt.Errorf("%w: action %d has empty node name", ErrDependencyPlanInvalid, i) }
+		if action.NodeName == "" {
+			return fmt.Errorf("%w: action %d has empty node name", ErrDependencyPlanInvalid, i)
+		}
 		if action.Action != DependencyActionWake && action.Action != DependencyActionSleep {
 			return fmt.Errorf("%w: action %d has unknown type %d", ErrDependencyPlanInvalid, i, action.Action)
 		}
 		node, ok := g.nodes[action.NodeName]
-		if !ok { return fmt.Errorf("%w: %q", ErrDependencyNodeNotFound, action.NodeName) }
+		if !ok {
+			return fmt.Errorf("%w: %q", ErrDependencyNodeNotFound, action.NodeName)
+		}
 		if node.component != action.Component || node.context != action.Context {
 			return fmt.Errorf("%w: action %d does not match current node metadata", ErrDependencyPlanInvalid, i)
 		}
@@ -115,15 +140,20 @@ func (g *DependencyGraph) validatePlanNodes(plan DependencyPlan) error {
 }
 
 func (g *DependencyGraph) planWakeLocked(name string) ([]DependencyAction, bool, error) {
-	if g.nodes[name].active { return nil, false, nil }
+	if g.nodes[name].active {
+		return nil, false, nil
+	}
 
 	candidate := make(map[string]struct{})
 	queue := []string{name}
 	candidate[name] = struct{}{}
 	for len(queue) > 0 {
-		current := queue[0]; queue = queue[1:]
+		current := queue[0]
+		queue = queue[1:]
 		for _, dependent := range sortedDependencyNames(g.nodes[current].dependents) {
-			if _, seen := candidate[dependent]; seen { continue }
+			if _, seen := candidate[dependent]; seen {
+				continue
+			}
 			candidate[dependent] = struct{}{}
 			queue = append(queue, dependent)
 		}
@@ -135,26 +165,40 @@ func (g *DependencyGraph) planWakeLocked(name string) ([]DependencyAction, bool,
 	indegree := make(map[string]int, len(candidate))
 	for nodeName := range candidate {
 		for provider := range g.nodes[nodeName].providers {
-			if !g.nodes[provider].active { indegree[nodeName]++ }
+			if !g.nodes[provider].active {
+				indegree[nodeName]++
+			}
 		}
 	}
 	ready := make([]string, 0, len(candidate))
-	for nodeName := range candidate { if indegree[nodeName] == 0 { ready = append(ready, nodeName) } }
+	for nodeName := range candidate {
+		if indegree[nodeName] == 0 {
+			ready = append(ready, nodeName)
+		}
+	}
 	sort.Strings(ready)
 
 	actions := make([]DependencyAction, 0, len(candidate))
 	changed := false
 	for len(ready) > 0 {
-		current := ready[0]; ready = ready[1:]
+		current := ready[0]
+		ready = ready[1:]
 		node := g.nodes[current]
 		if !node.active {
 			node.active = true
 			changed = true
-			actions = append(actions, DependencyAction{NodeName: node.name, Action: DependencyActionWake, Component: node.component, Context: node.context})
+			actions = append(actions, DependencyAction{
+				NodeName: current, Action: DependencyActionWake,
+				Component: node.component, Context: node.context,
+			})
 		}
 		for _, dependent := range sortedDependencyNames(node.dependents) {
-			if _, included := candidate[dependent]; !included { continue }
-			if indegree[dependent] > 0 { indegree[dependent]-- }
+			if _, included := candidate[dependent]; !included {
+				continue
+			}
+			if indegree[dependent] > 0 {
+				indegree[dependent]--
+			}
 			if indegree[dependent] == 0 {
 				ready = append(ready, dependent)
 				sort.Strings(ready)
@@ -165,80 +209,124 @@ func (g *DependencyGraph) planWakeLocked(name string) ([]DependencyAction, bool,
 }
 
 func (g *DependencyGraph) planSleepLocked(name string) ([]DependencyAction, bool, error) {
-	if !g.nodes[name].active { return nil, false, nil }
+	if !g.nodes[name].active {
+		return nil, false, nil
+	}
 
 	candidate := make(map[string]struct{})
 	queue := []string{name}
 	candidate[name] = struct{}{}
 	for len(queue) > 0 {
-		current := queue[0]; queue = queue[1:]
+		current := queue[0]
+		queue = queue[1:]
 		for _, dependent := range sortedDependencyNames(g.nodes[current].dependents) {
-			if _, seen := candidate[dependent]; seen { continue }
+			if _, seen := candidate[dependent]; seen {
+				continue
+			}
 			candidate[dependent] = struct{}{}
 			queue = append(queue, dependent)
 		}
 	}
 
-	// Determine the complete invalidation closure first. A node becomes
-	// invalid exactly when every provider is either already inactive or also
-	// invalidated by this transition. A remaining active provider protects a
-	// shared dependent (e.g. A -> D and B -> D when only A sleeps).
-	invalid := make(map[string]struct{})
-	invalid[name] = struct{}{}
+	// Compute the complete invalidation closure first. A dependent becomes
+	// invalid exactly when every provider is either inactive or also invalid.
+	invalid := map[string]struct{}{name: {}}
 	ordered, err := g.topologicalSubsetLocked(candidate)
-	if err != nil { return nil, false, err }
+	if err != nil {
+		return nil, false, err
+	}
 	for _, nodeName := range ordered {
-		if nodeName == name { continue }
+		if nodeName == name {
+			continue
+		}
 		node := g.nodes[nodeName]
-		if !node.active { continue }
+		if !node.active {
+			continue
+		}
 		valid := false
 		for provider := range node.providers {
-			if _, bad := invalid[provider]; bad { continue }
-			if g.nodes[provider].active { valid = true; break }
+			if _, bad := invalid[provider]; bad {
+				continue
+			}
+			if g.nodes[provider].active {
+				valid = true
+				break
+			}
 		}
-		if len(node.providers) == 0 { valid = true }
-		if !valid { invalid[nodeName] = struct{}{} }
+		if len(node.providers) == 0 {
+			valid = true
+		}
+		if !valid {
+			invalid[nodeName] = struct{}{}
+		}
 	}
 
 	// Reverse topological order guarantees dependents sleep before providers.
 	actions := make([]DependencyAction, 0, len(invalid))
 	for i := len(ordered) - 1; i >= 0; i-- {
 		nodeName := ordered[i]
-		if _, bad := invalid[nodeName]; !bad { continue }
+		if _, bad := invalid[nodeName]; !bad {
+			continue
+		}
 		node := g.nodes[nodeName]
-		if !node.active { continue }
+		if !node.active {
+			continue
+		}
 		node.active = false
-		actions = append(actions, DependencyAction{NodeName: node.name, Action: DependencyActionSleep, Component: node.component, Context: node.context})
+		if nodeName == name {
+			continue
+		}
+		actions = append(actions, DependencyAction{
+			NodeName: node.name, Action: DependencyActionSleep,
+			Component: node.component, Context: node.context,
+		})
 	}
-	return actions, len(actions) > 0, nil
+	return actions, true, nil
 }
 
 func (g *DependencyGraph) topologicalSubsetLocked(subset map[string]struct{}) ([]string, error) {
 	indegree := make(map[string]int, len(subset))
 	for nodeName := range subset {
 		for provider := range g.nodes[nodeName].providers {
-			if _, included := subset[provider]; included { indegree[nodeName]++ }
+			if _, included := subset[provider]; included {
+				indegree[nodeName]++
+			}
 		}
 	}
 	ready := make([]string, 0, len(subset))
-	for nodeName := range subset { if indegree[nodeName] == 0 { ready = append(ready, nodeName) } }
+	for nodeName := range subset {
+		if indegree[nodeName] == 0 {
+			ready = append(ready, nodeName)
+		}
+	}
 	sort.Strings(ready)
 	order := make([]string, 0, len(subset))
 	for len(ready) > 0 {
-		current := ready[0]; ready = ready[1:]; order = append(order, current)
+		current := ready[0]
+		ready = ready[1:]
+		order = append(order, current)
 		for _, dependent := range sortedDependencyNames(g.nodes[current].dependents) {
-			if _, included := subset[dependent]; !included { continue }
+			if _, included := subset[dependent]; !included {
+				continue
+			}
 			indegree[dependent]--
-			if indegree[dependent] == 0 { ready = append(ready, dependent); sort.Strings(ready) }
+			if indegree[dependent] == 0 {
+				ready = append(ready, dependent)
+				sort.Strings(ready)
+			}
 		}
 	}
-	if len(order) != len(subset) { return nil, ErrDependencyCycle }
+	if len(order) != len(subset) {
+		return nil, ErrDependencyCycle
+	}
 	return order, nil
 }
 
 func sortedDependencyNames(edges map[string]*dependencyEdge) []string {
 	out := make([]string, 0, len(edges))
-	for name := range edges { out = append(out, name) }
+	for name := range edges {
+		out = append(out, name)
+	}
 	sort.Strings(out)
 	return out
 }
