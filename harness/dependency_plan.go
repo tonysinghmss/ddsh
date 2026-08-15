@@ -34,9 +34,6 @@ type DependencyPlan struct {
 	Actions    []DependencyAction
 }
 
-// PlanWake atomically calculates a wake transition and commits the resulting
-// activation metadata before returning the immutable plan. No callbacks run
-// during planning.
 func (g *DependencyGraph) PlanWake(name string) (DependencyPlan, error) {
 	g.planMu.Lock()
 	defer g.planMu.Unlock()
@@ -55,9 +52,9 @@ func (g *DependencyGraph) PlanWake(name string) (DependencyPlan, error) {
 	return DependencyPlan{Generation: g.generation, Actions: actions}, nil
 }
 
-// PlanSleep atomically calculates downstream invalidation. The named root is
-// transitioned inactive in graph state, but its own sleep callback is not part
-// of the cascade plan: callers requested a downstream invalidation plan.
+// PlanSleep transitions the named root inactive and returns only the
+// downstream invalidation actions. The root's own lifecycle callback is not
+// part of the cascade plan.
 func (g *DependencyGraph) PlanSleep(name string) (DependencyPlan, error) {
 	g.planMu.Lock()
 	defer g.planMu.Unlock()
@@ -76,23 +73,28 @@ func (g *DependencyGraph) PlanSleep(name string) (DependencyPlan, error) {
 	return DependencyPlan{Generation: g.generation, Actions: actions}, nil
 }
 
-// Execute rejects a plan if its generation is no longer current. planMu
-// serializes execution against every graph state/topology transition, while
-// DependencyGraph.mu remains released for all application callbacks.
+// Execute validates generation and each action at an execution boundary, then
+// releases all graph synchronization before calling application code. A
+// concurrent graph transition is therefore detected before the next action.
 func (g *DependencyGraph) Execute(plan DependencyPlan) error {
-	g.planMu.Lock()
-	defer g.planMu.Unlock()
-	g.mu.RLock()
-	generation := g.generation
-	g.mu.RUnlock()
-	if plan.Generation != generation {
-		return fmt.Errorf("%w: plan generation=%d graph generation=%d", ErrDependencyPlanStale, plan.Generation, generation)
-	}
-	if err := g.validatePlanNodes(plan); err != nil {
-		return err
-	}
-
 	for _, action := range plan.Actions {
+		g.planMu.Lock()
+		g.mu.RLock()
+		generation := g.generation
+		valid := generation == plan.Generation
+		if valid {
+			valid = g.actionMatchesNodeLocked(action)
+		}
+		g.mu.RUnlock()
+		g.planMu.Unlock()
+
+		if !valid {
+			return fmt.Errorf("%w: plan generation=%d graph generation=%d", ErrDependencyPlanStale, plan.Generation, generation)
+		}
+		if action.Action != DependencyActionWake && action.Action != DependencyActionSleep {
+			return fmt.Errorf("%w: unknown action type %d", ErrDependencyPlanInvalid, action.Action)
+		}
+
 		switch action.Action {
 		case DependencyActionWake:
 			if action.Component != nil {
@@ -105,8 +107,6 @@ func (g *DependencyGraph) Execute(plan DependencyPlan) error {
 			if action.Context != nil {
 				action.Context.Rollback()
 			}
-		default:
-			return fmt.Errorf("%w: unknown action type %d", ErrDependencyPlanInvalid, action.Action)
 		}
 	}
 	return nil
@@ -118,25 +118,18 @@ func (g *DependencyGraph) Generation() uint64 {
 	return g.generation
 }
 
-func (g *DependencyGraph) validatePlanNodes(plan DependencyPlan) error {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	for i, action := range plan.Actions {
-		if action.NodeName == "" {
-			return fmt.Errorf("%w: action %d has empty node name", ErrDependencyPlanInvalid, i)
-		}
-		if action.Action != DependencyActionWake && action.Action != DependencyActionSleep {
-			return fmt.Errorf("%w: action %d has unknown type %d", ErrDependencyPlanInvalid, i, action.Action)
-		}
-		node, ok := g.nodes[action.NodeName]
-		if !ok {
-			return fmt.Errorf("%w: %q", ErrDependencyNodeNotFound, action.NodeName)
-		}
-		if node.component != action.Component || node.context != action.Context {
-			return fmt.Errorf("%w: action %d does not match current node metadata", ErrDependencyPlanInvalid, i)
-		}
+func (g *DependencyGraph) actionMatchesNodeLocked(action DependencyAction) bool {
+	if action.NodeName == "" {
+		return false
 	}
-	return nil
+	node, ok := g.nodes[action.NodeName]
+	if !ok {
+		return false
+	}
+	if action.Action != DependencyActionWake && action.Action != DependencyActionSleep {
+		return false
+	}
+	return node.component == action.Component && node.context == action.Context
 }
 
 func (g *DependencyGraph) planWakeLocked(name string) ([]DependencyAction, bool, error) {
@@ -228,8 +221,6 @@ func (g *DependencyGraph) planSleepLocked(name string) ([]DependencyAction, bool
 		}
 	}
 
-	// Compute the complete invalidation closure first. A dependent becomes
-	// invalid exactly when every provider is either inactive or also invalid.
 	invalid := map[string]struct{}{name: {}}
 	ordered, err := g.topologicalSubsetLocked(candidate)
 	if err != nil {
@@ -261,7 +252,6 @@ func (g *DependencyGraph) planSleepLocked(name string) ([]DependencyAction, bool
 		}
 	}
 
-	// Reverse topological order guarantees dependents sleep before providers.
 	actions := make([]DependencyAction, 0, len(invalid))
 	for i := len(ordered) - 1; i >= 0; i-- {
 		nodeName := ordered[i]
