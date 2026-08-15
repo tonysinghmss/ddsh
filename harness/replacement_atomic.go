@@ -50,7 +50,7 @@ func (g *DependencyGraph) replaceNodeRuntimeUnlocked(name string, component Comp
 		NodeName: name,
 		Action: DependencyActionWake,
 		Component: component,
-		Context: d.context,
+		Context: ctx,
 	})
 	actions = append(actions, g.planEligibleDependentsLocked(name)...)
 	g.generation++
