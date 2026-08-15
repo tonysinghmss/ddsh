@@ -118,7 +118,8 @@ func TestDependencyTrackerCycleRejectionIsAtomic(t *testing.T) {
 	dt.RegisterComponent(context.Background(), c)
 	before := dt.Graph().EdgeCount()
 	if err := dt.RegisterComponentErr(context.Background(), a); !errors.Is(err, ErrDependencyCycle) { t.Fatalf("err=%v", err) }
-	if dt.Graph().HasNode("A") { t.Fatal("cycle rejection partially registered A") }
+	if !dt.Graph().HasNode("A") { t.Fatal("existing provider placeholder disappeared") }
+	if _, ok := dt.Graph().Node("A"); !ok || dt.Graph().Node("A").Component != nil { t.Fatal("failed registration partially installed component A") }
 	if dt.Graph().EdgeCount() != before { t.Fatalf("edge count changed: %d -> %d", before, dt.Graph().EdgeCount()) }
 }
 
